@@ -1,6 +1,6 @@
 # ocr-review (shared)
 
-Reusable [`workflow_call`](https://docs.github.com/en/actions/using-workflows/reusing-workflows)
+Reusable self-test marker -8f3- [`workflow_call`](https://docs.github.com/en/actions/using-workflows/reusing-workflows)
 workflow that runs [OpenCodeReview](https://github.com/alibaba/open-code-review)
 on pull requests, with the account-wide tuned configuration:
 
