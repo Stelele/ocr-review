@@ -6,14 +6,13 @@
 # action pin, noise-reduction inputs and wording changes are made HERE once
 # and apply everywhere on the next run.
 #
-# Reusable workflows cannot trigger on their own events, so the `pull_request`
-# trigger below only exists to self-test this repo's own PRs.
+# This file is consumed by every repo's dispatcher (see README); it has no own
+# event triggers — validation happens on the calling repos' pull_request runs,
+# which carry their own OCR_LLM_* secrets via `secrets: inherit`.
 name: ocr-review
 
 on:
   workflow_call:
-  pull_request:
-    types: [opened, synchronize, reopened]
 
 concurrency:
   group: ocr-review-${{ github.ref }}
