@@ -5,13 +5,13 @@ workflow that runs [OpenCodeReview](https://github.com/alibaba/open-code-review)
 on pull requests, with the account-wide tuned configuration:
 
 - `incremental` — never re-posts a finding whose (path, line) already has a bot comment
-- `checkpoint_range` — next push reviews only what changed since the last reviewed head
-- `resolve_outdated` — auto-resolves the bot's own stale threads (needs `contents: write` from the caller)
-- `route_severity_below: low` + `route_categories: style,documentation,other` — noise goes to the sticky summary, inline stays actionable
+- `checkpoint_range` — the next push reviews only what changed since the last reviewed head
+- `resolve_outdated` — auto-resolves the bot's own stale threads (caller must grant `contents: write`)
+- `route_severity_below: low` + `route_categories: style,documentation,other` — noise goes to the sticky summary; inline comments stay actionable
 
-## One thing to edit, everywhere
+## One config, everywhere
 
-Config changes are made **only here**. Each consumer repo's
+Edit the reviewer configuration **only here**. Each consumer repo's
 `.github/workflows/ocr-review.yml` is a dispatcher:
 
 ```yaml
@@ -19,9 +19,11 @@ name: ocr-review
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+
 permissions:
   contents: write   # resolve_outdated needs it
   pull-requests: write
+
 jobs:
   review:
     name: ai code review

@@ -1,0 +1,88 @@
+# Reusable OpenCodeReview workflow — the single source of the review bot
+# configuration for this account.
+#
+# Called workflow: every repo runs its own `.github/workflows/ocr-review.yml`
+# dispatcher (`pull_request` -> `uses:` this file, `secrets: inherit`), so the
+# action pin, noise-reduction inputs and wording changes are made HERE once
+# and apply everywhere on the next run.
+#
+# Reusable workflows cannot trigger on their own events, so the `pull_request`
+# trigger below only exists to self-test this repo's own PRs.
+name: ocr-review
+
+on:
+  workflow_call:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ocr-review-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  # contents: write is required by resolve_outdated (GitHub gates the resolve
+  # mutation on repository write access, not on the pull-requests scope) and
+  # for posting review comments through checks/diffs that need it
+  contents: write
+  pull-requests: write
+
+jobs:
+  review:
+    name: ai code review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Verify required secrets
+        env:
+          INJECT_URL: ${{ secrets.OCR_LLM_URL }}
+          INJECT_TOKEN: ${{ secrets.OCR_LLM_TOKEN }}
+          INJECT_MODEL: ${{ secrets.OCR_LLM_MODEL }}
+        run: |
+          for v in INJECT_URL INJECT_TOKEN INJECT_MODEL; do
+            if [ -z "${!v}" ]; then
+              echo "::error::$v is empty. Provision repo secrets OCR_LLM_URL / OCR_LLM_TOKEN / OCR_LLM_MODEL (OpenCode Go endpoint, API key, and model id) before enabling review."
+              exit 1
+            fi
+          done
+      - name: Run OpenCodeReview
+        # alibaba/open-code-review, pinned to a full commit SHA (dependabot's
+        # SHA-commented pattern). SHA was resolved live from upstream's
+        # v1.13.5 release via the commits API and equals the release head —
+        # re-verify on bump: gh api repos/alibaba/open-code-review/releases/latest --jq .target_commitish
+        # NOTE: no actions/checkout here BY DESIGN — the composite action
+        # checks out the trusted base itself with fetch-depth: 0 and fetches
+        # the PR head separately (fork-safe). Adding our own checkout is
+        # redundant work only.
+        uses: alibaba/open-code-review@abb7abcd5c5196fa0278dc87db85780fa269562f
+        with:
+          # Secrets referenced directly: values are single-line, the guard above
+          # proves they resolve, and (per ocr-review discussion) env-context
+          # indirection only adds a second copy of sensitive values. Inherited
+          # from the caller repo via `secrets: inherit` in each dispatcher.
+          llm_url: ${{ secrets.OCR_LLM_URL }}
+          llm_auth_token: ${{ secrets.OCR_LLM_TOKEN }}
+          llm_model: ${{ secrets.OCR_LLM_MODEL }}
+          llm_use_anthropic: "false"
+          llm_extra_headers: "x-opencode-session=ocr-review-${{ github.event.pull_request.number }}"
+          language: English
+          stream_progress: "true"
+          sticky_summary: "true"
+          # --- noise-reduction + continuity (all documented inputs of the pinned
+          # action; every one is fail-closed) ---
+          # Incremental: never re-post an inline comment whose (path, line) range
+          # overlaps a bot comment already under the PR.
+          incremental: "true"
+          # Checkpoint: record the reviewed head in the sticky summary and review
+          # only <checkpoint>..<new head> on the next push, instead of the whole
+          # merge-base diff again (full review happens if anything is in doubt).
+          checkpoint_range: "true"
+          # Auto-resolve the bot's own outdated inline threads (their lines no
+          # longer exist in the diff). Threads a human replied to, threads
+          # already resolved, and threads a live finding still covers are left
+          # alone. Needs contents: write above to work.
+          resolve_outdated: "true"
+          # Route the low/noise categories (style, docs) and low-severity
+          # findings to the sticky PR summary instead of inline comments, so
+          # inline comments stay focused on actionable findings.
+          route_severity_below: "low"
+          route_categories: "style,documentation,other"
