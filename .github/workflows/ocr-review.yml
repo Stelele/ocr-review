@@ -62,6 +62,12 @@ jobs:
           llm_auth_token: ${{ secrets.OCR_LLM_TOKEN }}
           llm_model: ${{ secrets.OCR_LLM_MODEL }}
           llm_use_anthropic: "false"
+          # The action's default extra body disables thinking — fine for
+          # non-reasoning models, but OpenCode Go's GLM-5.3 is thinking-only
+          # and answers every call with 400 "disabling thinking is not
+          # supported". Send an explicit reasoning_effort instead: honest
+          # depth for the model, no disabled-thinking key anywhere.
+          llm_extra_body: '{"reasoning_effort": "medium"}'
           llm_extra_headers: "x-opencode-session=ocr-review-${{ github.event.pull_request.number }}"
           language: English
           stream_progress: "true"
