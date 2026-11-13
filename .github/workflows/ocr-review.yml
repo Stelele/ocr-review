@@ -29,10 +29,10 @@ jobs:
   review:
     name: ai code review
     runs-on: ubuntu-latest
-    # 30 min covered the review alone; the verdict sweeper adds a worst case of
-    # VERDICT_MAX_THREADS x (LLM timeout + retry + pacing), so the ceiling is
-    # raised. It is a ceiling, not a target — typical runs stay under 10.
-    timeout-minutes: 45
+    # The review step can use up to ~30 min (the old ceiling) and the verdict
+    # sweeper adds its own wall budget (default 25), so the ceiling covers the
+    # sum. It is a ceiling, not a target — typical runs stay under 10.
+    timeout-minutes: 55
     steps:
       - name: Verify required secrets
         env:
@@ -462,10 +462,11 @@ jobs:
                 console.log(`[verdict-sweeper] ${path}: head entry is ${entry.type}/mode ${entry.mode}, not a regular file; skipping`)
                 return UNCLEAR
               }
-              // entry.size is BYTES. UTF-8 needs at most 4 bytes per char, so size above
-              // 2x the char budget guarantees an oversized file; sizes between the budgets
-              // are checked exactly after decode (fetchBlob is authoritative).
-              if (entry.size != null && entry.size > 2 * MAX_FILE_CHARS) {
+              // entry.size is BYTES. UTF-8 needs up to 4 bytes per char, so only size
+              // above 4x the char budget GUARANTEES an oversized file; anything below is
+              // checked exactly after decode (fetchBlob is authoritative). This is a
+              // cheap pre-filter, not the enforcement.
+              if (entry.size != null && entry.size > 4 * MAX_FILE_CHARS) {
                 console.log(`[verdict-sweeper] ${path}: ${entry.size} bytes exceeds the ${MAX_FILE_CHARS} char budget, skipping (fail-closed)`)
                 return UNCLEAR
               }
@@ -926,6 +927,9 @@ jobs:
               const selected = headMoved ? [] : candidates.slice(0, MAX_THREADS)
               // Stage 1: the calibrated Noul screen (opt-in). Everything it cannot judge
               // stays absent from the map and goes to stage 2 unchanged.
+              if (skipped.not_ocr > total / 2 && total > 0) {
+                console.log(`[verdict-sweeper] warning: ${skipped.not_ocr}/${total} threads failed ownership detection — the review bot's token identity or comment format may have changed; if this is unexpected, check BOT_LOGINS/severityOf in the sweeper script`)
+              }
               const screen = await jevScreen(selected, tree, startedAt)
               if (screen.size > 0) {
                 const bands = { resolve: 0, present: 0, uncertain: 0 }
@@ -938,6 +942,13 @@ jobs:
               const worstCaseMs = MAX_THREADS * (2 * LLM_TIMEOUT_MS + 2 * DELAY_MS + 90000)
               if (worstCaseMs > WALL_BUDGET_MS) {
                 console.log(`[verdict-sweeper] warning: VERDICT_MAX_THREADS=${MAX_THREADS} worst case (~${Math.round(worstCaseMs / 60000)} min) exceeds the ${WALL_BUDGET_MS / 60000}-min wall budget; expect deferred candidates every run — lower MAX_THREADS or raise VERDICT_WALL_BUDGET_MIN`)
+              }
+              // The wall budget shares the job's 45-minute ceiling with the review step
+              // that runs first (up to ~30 min historically). A budget above ~40 min can
+              // get the job killed mid-resolve — keep the ceiling comment and this guard
+              // in sync if the job timeout changes.
+              if (WALL_BUDGET_MS > 40 * 60000) {
+                console.log(`[verdict-sweeper] warning: VERDICT_WALL_BUDGET_MIN=${WALL_BUDGET_MS / 60000} exceeds the ~40 min safely available under the 45-min job ceiling (the review step runs first); the job may be killed mid-resolve`)
               }
               for (let i = 0; i < selected.length; i++) {
                 const c = selected[i]
@@ -995,6 +1006,10 @@ jobs:
                     // path MISSING from a TRUNCATED base tree is unknown, not unchanged —
                     // only a complete tree can prove the path was absent at the base.
                     const baseSha = await getMergeBase()
+                    if (!baseSha) {
+                      console.log(`[verdict-sweeper] ${c.path}: no base SHA available for the file-changed gate; escalating to reasoning LLM: "${short}"`)
+                      outcome.jev_escalated++
+                    } else {
                     const baseTree = await treeAt(baseSha)
                     const baseEntry = baseTree.entries.get(c.path)
                     if (baseEntry && baseEntry.sha === hit.sha) {
@@ -1016,6 +1031,7 @@ jobs:
                       continue
                     }
                     }
+                  }
                   }
                   if (s?.band === 'uncertain') outcome.jev_uncertain++
                   const content = await fetchBlob(hit.sha)
@@ -1061,7 +1077,10 @@ jobs:
           SWEEPER_DIR="$(mktemp -d)"
           printf '%s\n' "$SWEEPER_SCRIPT" > "$SWEEPER_DIR/verdict-sweeper.mjs"
           node --check "$SWEEPER_DIR/verdict-sweeper.mjs"
-          node "$SWEEPER_DIR/verdict-sweeper.mjs"
+          # A fatal exit (missing secrets, old node, bad tree fetch) must not
+          # fail the completed review (continue-on-error below), but it must
+          # not be invisible either — surface it as a run annotation.
+          node "$SWEEPER_DIR/verdict-sweeper.mjs" || echo "::warning::verdict sweeper exited fatally; see the [verdict-sweeper] log lines above" 
         # mktemp/printf semantics are relied upon — pin the shell explicitly so
         # self-hosted runners don't fall back to sh or pwsh.
         shell: bash
