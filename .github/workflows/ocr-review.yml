@@ -238,6 +238,16 @@ jobs:
               console.log(`[verdict-sweeper] VERDICT_WALL_BUDGET_MIN="${process.env.VERDICT_WALL_BUDGET_MIN}" is not a positive number; using default ${WALL_BUDGET_MS / 60000}`)
             }
 
+            // Backoff between retry attempts; honors Retry-After when GitHub sends it on 429.
+            async function sleepAndRetry(attempt, res) {
+              let ms = attempt * 1000
+              if (res) {
+                const ra = res.headers?.get?.('retry-after')
+                if (ra && Number.isFinite(Number(ra))) ms = Math.max(ms, Number(ra) * 1000)
+              }
+              await sleep(ms + Math.floor(Math.random() * 250))
+            }
+
             // Shared GitHub fetch with bounded retries: honors Retry-After on 429, retries
             // 5xx, network blips and non-JSON 200 bodies (proxies), 2 retries max. GraphQL
             // errors are semantic, not transient — they throw on first sight.
@@ -505,7 +515,10 @@ jobs:
               let res2 = res
               for (let attempt = 0; attempt < 2; attempt++) {
                 if (attempt > 0) {
+                  // Same backoff policy as githubJson (Retry-After honored) and drain the
+                  // previous response so the socket is released before retrying.
                   await sleepAndRetry(2, res2)
+                  try { await res2.arrayBuffer() } catch { /* body already consumed */ }
                   res2 = await postLlm()
                 }
                 let body = null
@@ -589,7 +602,9 @@ jobs:
               const tree = await treeAt(commitSha)
               const entry = tree.entries.get(path)
               if (!entry) return tree.complete ? null : UNCLEAR
-              if (entry.type !== 'blob') return UNCLEAR
+              // Same guards as headFile: symlinks are blobs whose content is the target
+              // path string, and submodules are commits — neither is evidence-grade text.
+              if (entry.type !== 'blob' || entry.mode === '120000' || entry.mode === '160000') return UNCLEAR
               if (entry.size != null && entry.size > MAX_FILE_CHARS) return UNCLEAR
               return fetchBlob(entry.sha)
             }
