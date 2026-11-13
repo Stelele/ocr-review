@@ -158,11 +158,14 @@ jobs:
           VERDICT_JEV_RESOLVE_BELOW: ${{ vars.VERDICT_JEV_RESOLVE_BELOW }}
           VERDICT_JEV_PRESENT_ABOVE: ${{ vars.VERDICT_JEV_PRESENT_ABOVE }}
           JEV_MODEL: ${{ vars.JEV_MODEL }}
-          # JEV_TOKEN is deliberately NOT mapped here: the script falls back to
-          # OCR_LLM_TOKEN (the OpenCode key serves both endpoints), and an
-          # explicit JEV_TOKEN is what tells the script "this token was chosen
-          # for Jev on purpose" — which is the only condition under which the
-          # screen runs when OCR_LLM_URL points at a non-opencode provider.
+          # JEV_TOKEN is deliberately NOT mapped to OCR_LLM_TOKEN: the script
+          # falls back to OCR_LLM_TOKEN itself (the OpenCode key serves both
+          # endpoints), and an explicitly provisioned JEV_TOKEN secret is what
+          # tells the script "this token was chosen for Jev on purpose" — the
+          # only condition under which the screen runs when OCR_LLM_URL points
+          # at a non-opencode provider. An unprovisioned secret maps to an
+          # empty string, which keeps the fallback + host-check behaviour.
+          JEV_TOKEN: ${{ secrets.JEV_TOKEN }}
           SWEEPER_SCRIPT: |
             // verdict-sweeper — resolve OCR review threads whose finding no longer exists in the head code.
             //
@@ -522,11 +525,12 @@ jobs:
             // Severity badge: every OCR inline comment starts with a shields.io badge like
             // ![security · critical](https://img.shields.io/badge/security-critical-darkred).
             // Read mechanically from the raw body BEFORE the badges are stripped, anchored
-            // to a line start: a badge URL quoted deeper in the prose must not downgrade a
+            // to a line start with [ \t]* only ([\s]* would cross newlines and match a
+            // badge quoted anywhere in the prose): a deeper badge cannot downgrade a
             // critical finding past the severity cap. Unmatched -> 'unknown' -> escalates
             // to the reasoning LLM (fail-closed).
             function severityOf(rawBody) {
-              const m = rawBody.match(/^\s*!\[[^\]]*\]\(https:\/\/img\.shields\.io\/badge\/[^)\s]*[-–](critical|high|medium|low)-[a-z]+\)/im)
+              const m = rawBody.match(/^[ \t]*!\[[^\]]*\]\(https:\/\/img\.shields\.io\/badge\/[^)\s]*[-–](critical|high|medium|low)-[a-z]+\)/im)
               return m ? m[1].toLowerCase() : 'unknown'
             }
 
@@ -843,7 +847,7 @@ jobs:
               let ji = 0
               let failures = 0
               let budgetStopped = false
-              let batchesDone = 0
+              const doneIndices = new Set()
               await Promise.all(
                 Array.from({ length: JEV_CONCURRENCY }, async () => {
                   for (;;) {
@@ -928,13 +932,18 @@ jobs:
                       failures++
                       console.log(`[verdict-sweeper] jev screen FAIL ${path} (${cs.length} candidates): ${e.message} — they fall through to the reasoning LLM`)
                     }
-                    batchesDone++
+                    doneIndices.add(i)
                     await sleep(JEV_PACE_MS)
                   }
                 })
               )
               if (budgetStopped) {
-                const remaining = batchList.slice(batchesDone).reduce((s, [, cs]) => s + cs.length, 0)
+                // Workers complete out of index order, so "remaining" is computed from the
+                // set of indices actually processed, not a prefix slice.
+                let remaining = 0
+                for (let i = 0; i < batchList.length; i++) {
+                  if (!doneIndices.has(i)) remaining += batchList[i][1].length
+                }
                 console.log(`[verdict-sweeper] wall-clock budget reached during the jev screen; ${remaining} candidates skip the screen and go to the reasoning LLM`)
               }
               // Severity format drift: if most candidates have no parseable badge, an
@@ -1135,8 +1144,12 @@ jobs:
             }
         run: |
           SWEEPER_DIR="$(mktemp -d)"
+          # Self-hosted runners persist the workspace: clean up on any exit.
+          trap 'rm -rf "$SWEEPER_DIR"' EXIT
           printf '%s\n' "$SWEEPER_SCRIPT" > "$SWEEPER_DIR/verdict-sweeper.mjs"
-          node --check "$SWEEPER_DIR/verdict-sweeper.mjs"
+          # Syntax failures are annotated too — continue-on-error below would
+          # otherwise swallow a broken inline script silently.
+          node --check "$SWEEPER_DIR/verdict-sweeper.mjs" || echo "::warning::verdict sweeper script failed the syntax check; see the workflow diff"
           # A fatal exit (missing secrets, old node, bad tree fetch) must not
           # fail the completed review (continue-on-error below), but it must
           # not be invisible either — surface it as a run annotation.
