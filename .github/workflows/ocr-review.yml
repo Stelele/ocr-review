@@ -91,3 +91,29 @@ jobs:
           # inline comments stay focused on actionable findings.
           route_severity_below: "low"
           route_categories: "style,documentation,other"
+      - name: Resolve findings fixed in the head code (verdict sweeper)
+        # resolve_outdated above only resolves threads whose lines LEFT the diff;
+        # a fix that rewrites the commented lines in place never becomes outdated,
+        # so those threads would stay open forever. This step asks the LLM, per
+        # unresolved OCR-owned thread, whether the finding still holds against the
+        # CURRENT head version of the file, and resolves it on a confident "fixed".
+        # Fail-closed: human-replied threads, non-OCR threads, low confidence,
+        # unclear verdicts and any error are all skipped. One cheap LLM call per
+        # lingering thread, paced by VERDICT_DELAY_MS.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCR_REPOSITORY: ${{ github.repository }}
+          OCR_PR_NUMBER: ${{ github.event.pull_request.number }}
+          OCR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
+          OCR_LLM_TOKEN: ${{ secrets.OCR_LLM_TOKEN }}
+          OCR_LLM_MODEL: ${{ secrets.OCR_LLM_MODEL }}
+        run: |
+          # The script lives in THIS repo (the caller checked nothing out), so
+          # fetch it directly. Config lives here by design — an edit to the
+          # sweeper reaches every repo on its next run.
+          if gh api repos/Stelele/ocr-review/contents/scripts/verdict-sweeper.mjs --jq .content | base64 -d > verdict-sweeper.mjs; then
+            node verdict-sweeper.mjs
+          else
+            echo "::warning::could not fetch verdict-sweeper.mjs from Stelele/ocr-review; skipping thread resolution"
+          fi
