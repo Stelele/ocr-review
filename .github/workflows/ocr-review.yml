@@ -97,7 +97,8 @@ jobs:
         # so those threads would stay open forever. This step asks the LLM, per
         # unresolved OCR-owned thread, whether the finding still holds against the
         # CURRENT head version of the file, and resolves it on a confident "fixed"
-        # whose evidence quote is verified verbatim against that file.
+        # whose evidence quote is verified verbatim against that file AND shown to
+        # be new code (absent from the base version).
         # Fail-closed: human-replied threads (including replies beyond the first
         # 100 comments), non-OCR threads, low confidence, unclear verdicts,
         # evidence mismatches and any error are all skipped.
@@ -120,6 +121,7 @@ jobs:
           OCR_REPOSITORY: ${{ github.repository }}
           OCR_PR_NUMBER: ${{ github.event.pull_request.number }}
           OCR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OCR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
           OCR_LLM_TOKEN: ${{ secrets.OCR_LLM_TOKEN }}
           OCR_LLM_MODEL: ${{ secrets.OCR_LLM_MODEL }}
@@ -153,7 +155,7 @@ jobs:
             // a second layer, not a licence to enable forks.
             //
             // Config: OCR_LLM_URL / OCR_LLM_TOKEN / OCR_LLM_MODEL (same secrets the review step uses),
-            // GITHUB_TOKEN, OCR_REPOSITORY ("owner/name"), OCR_PR_NUMBER, OCR_HEAD_SHA.
+            // GITHUB_TOKEN, OCR_REPOSITORY, OCR_PR_NUMBER, OCR_HEAD_SHA, OCR_BASE_SHA.
             // Optional: VERDICT_MAX_THREADS (default 25 per run), VERDICT_DELAY_MS (default 800).
             //
             // Usage: node verdict-sweeper.mjs [--dry-run]
@@ -164,6 +166,7 @@ jobs:
             const REPO = process.env.OCR_REPOSITORY || ''
             const PR_NUMBER = Number(process.env.OCR_PR_NUMBER || 0)
             const HEAD_SHA = process.env.OCR_HEAD_SHA || ''
+            const BASE_SHA = process.env.OCR_BASE_SHA || ''
             const LLM_URL = (process.env.OCR_LLM_URL || '').replace(/\/+$/, '')
             const LLM_TOKEN = process.env.OCR_LLM_TOKEN || ''
             const LLM_MODEL = process.env.OCR_LLM_MODEL || ''
@@ -173,9 +176,18 @@ jobs:
             const GH_TIMEOUT_MS = 30000   // GitHub API calls
             const LLM_TIMEOUT_MS = 120000 // thinking-model verdicts legitimately run long
 
+            // Machine-generated content is never worth an LLM verdict: it bloats tokens and
+            // can carry semi-sensitive data. Extension denylist plus well-known lockfiles
+            // and minified bundles.
+            const BINARYISH_RE = /\.(png|jpe?g|gif|webp|avif|ico|svgz?|woff2?|ttf|otf|eot|zip|gz|tgz|tar|7z|rar|pdf|docx?|xlsx?|pptx?|mp4|mp3|wav|ogg|webm|mov|bin|exe|dll|so|dylib|wasm|class|jar|node|pyc|dat|db|sqlite3?)$/i
+            const GENERATED_RE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|composer\.lock|Cargo\.lock|poetry\.lock|Gemfile\.lock|bun\.lockb|\.DS_Store)$|\.min\.(js|css)$/i
+
             if (!REPO || !PR_NUMBER || !HEAD_SHA) {
               console.error('[verdict-sweeper] OCR_REPOSITORY / OCR_PR_NUMBER / OCR_HEAD_SHA are required')
               process.exit(1)
+            }
+            if (!BASE_SHA) {
+              console.log('[verdict-sweeper] OCR_BASE_SHA not set: the evidence-is-new-code check is disabled (less strict than intended)')
             }
             if (!LLM_URL || !LLM_TOKEN || !LLM_MODEL) {
               console.error('[verdict-sweeper] OCR_LLM_URL / OCR_LLM_TOKEN / OCR_LLM_MODEL are required — failing fast instead of per-thread')
@@ -242,13 +254,13 @@ jobs:
             // a "fixed" verdict.
             const UNCLEAR = Symbol('unclear')
 
-            async function fetchHeadTree() {
-              const tree = await rest(`/repos/${REPO}/git/trees/${HEAD_SHA}?recursive=1`)
+            async function fetchTree(sha) {
+              const tree = await rest(`/repos/${REPO}/git/trees/${sha}?recursive=1`)
               // `truncated` is the documented git-trees signal. If the shape ever changes,
-              // treat the tree as complete would be dangerous — so check only the known
+              // treating the tree as complete would be dangerous — so check only the known
               // field and log anything unexpected rather than guessing.
               if (tree.truncated === true) {
-                console.log('[verdict-sweeper] warning: head tree is truncated; missing paths will be judged unclear, not deleted')
+                console.log('[verdict-sweeper] warning: tree is truncated; missing paths will be judged unclear, not deleted')
                 return { entries: new Map(tree.tree.map((e) => [e.path, e])), complete: false }
               }
               if (tree.truncated !== undefined && tree.truncated !== false) {
@@ -258,7 +270,7 @@ jobs:
             }
 
             // Returns: null (verified deletion from a COMPLETE tree), UNCLEAR (cannot judge),
-            // or { sha } for a plain file at head.
+            // or { sha, size } for a plain text file at head.
             function headFile(tree, path) {
               const entry = tree.entries.get(path)
               if (!entry) {
@@ -274,7 +286,15 @@ jobs:
                 console.log(`[verdict-sweeper] ${path}: head entry is ${entry.type}, not a blob; skipping`)
                 return UNCLEAR
               }
-              return { sha: entry.sha }
+              if (entry.size != null && entry.size > MAX_FILE_CHARS) {
+                console.log(`[verdict-sweeper] ${path}: ${entry.size} bytes exceeds the ${MAX_FILE_CHARS} limit, skipping (fail-closed)`)
+                return UNCLEAR
+              }
+              if (BINARYISH_RE.test(path) || GENERATED_RE.test(path)) {
+                console.log(`[verdict-sweeper] ${path}: machine-generated or binary content is not sent to the LLM; skipping`)
+                return UNCLEAR
+              }
+              return { sha: entry.sha, size: entry.size }
             }
 
             async function fetchBlob(sha) {
@@ -428,19 +448,46 @@ jobs:
               // file cannot fabricate proof of a fix; they can only be quoted back.
               //
               // Residual risk, accepted and documented: containment proves the quote exists,
-              // not that it proves the fix. Two mechanical strengthenings: a minimum length
-              // (a one-word quote is noise), and the evidence must NOT be a substring of the
-              // finding itself — proof of a fix is the NEW code, not the flagged line quoted
-              // back from the review text. The remaining judgment ("does this quote show the
-              // problem is gone?") is the model's, which is the point of the sweeper; the
-              // merge gate still adjudicates anything a human disagrees with.
+              // not that it proves the fix. Three mechanical strengthenings: a minimum length
+              // (a one-word quote is noise); the evidence must NOT be a substring of the
+              // finding itself (proof of a fix is the NEW code, not the flagged line quoted
+              // back from the review text); and the quote must NOT already exist in the BASE
+              // version of the file — if the file never changed, nothing was fixed on this
+              // path, and evidence that is pre-existing code is not proof of anything. The
+              // remaining judgment ("does this new code show the problem is gone?") is the
+              // model's, which is the point of the sweeper; the merge gate still adjudicates
+              // anything a human disagrees with.
               if (v === 'fixed' && conf === 'high') {
                 if (!evidence) throw new Error('fixed/high without evidence quote')
                 if (evidence.length < 12) throw new Error(`evidence quote too short to prove a fix: "${evidence.slice(0, 40)}"`)
                 if (finding.includes(evidence)) throw new Error(`evidence quote is copied from the finding, not the fixed code: "${evidence.slice(0, 60)}"`)
                 if (!content.includes(evidence)) throw new Error(`evidence quote not found in head file: "${evidence.slice(0, 80)}"`)
+                if (BASE_SHA) {
+                  const baseContent = await fileAt(BASE_SHA, path)
+                  if (baseContent === UNCLEAR) throw new Error('cannot verify evidence is new code (base version unreadable)')
+                  if (baseContent !== null && baseContent.includes(evidence)) {
+                    throw new Error('evidence quote already exists in the base version — file unchanged, nothing was fixed here')
+                  }
+                }
               }
               return { verdict: v, confidence: conf, evidence }
+            }
+
+            // File content at an arbitrary commit (used for the base-version evidence check).
+            // null = path absent from a complete tree; UNCLEAR = cannot judge.
+            const treeCache = new Map()
+            async function treeAt(sha) {
+              if (!treeCache.has(sha)) treeCache.set(sha, await fetchTree(sha))
+              return treeCache.get(sha)
+            }
+
+            async function fileAt(commitSha, path) {
+              const tree = await treeAt(commitSha)
+              const entry = tree.entries.get(path)
+              if (!entry) return tree.complete ? null : UNCLEAR
+              if (entry.type !== 'blob') return UNCLEAR
+              if (entry.size != null && entry.size > MAX_FILE_CHARS) return UNCLEAR
+              return fetchBlob(entry.sha)
             }
 
             async function resolveThread(id) {
@@ -461,7 +508,7 @@ jobs:
               const { candidates, skipped, total, enumerated } = await listCandidates()
               console.log(`[verdict-sweeper] threads=${total} enumerated=${enumerated} resolved_before=${skipped.resolved} not_ocr=${skipped.not_ocr} human_replied=${skipped.human_replied} candidates=${candidates.length}`)
               outcome.candidates = candidates.length
-              const tree = await fetchHeadTree()
+              const tree = await treeAt(HEAD_SHA)
               const deferred = Math.max(0, candidates.length - MAX_THREADS)
               if (deferred > 0) {
                 outcome.deferred = deferred
@@ -526,3 +573,6 @@ jobs:
           printf '%s\n' "$SWEEPER_SCRIPT" > "$SWEEPER_DIR/verdict-sweeper.mjs"
           node --check "$SWEEPER_DIR/verdict-sweeper.mjs"
           node "$SWEEPER_DIR/verdict-sweeper.mjs"
+        # mktemp/printf semantics are relied upon — pin the shell explicitly so
+        # self-hosted runners don't fall back to sh or pwsh.
+        shell: bash
