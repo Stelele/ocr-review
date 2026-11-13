@@ -747,10 +747,11 @@ jobs:
               const entry = tree.entries.get(path)
               if (!entry) return tree.complete ? null : UNCLEAR
               // Same guards and byte pre-filter as headFile: symlinks are blobs whose
-              // content is the target path string, submodules are commits, and the
-              // 2x-byte conservative filter keeps both lookups consistent.
+              // content is the target path string, submodules are commits, and the 4x-byte
+              // conservative filter keeps both lookups consistent (a file accepted at
+              // head must not be rejected at base for a different threshold).
               if (entry.type !== 'blob' || entry.mode === '120000' || entry.mode === '160000') return UNCLEAR
-              if (entry.size != null && entry.size > 2 * MAX_FILE_CHARS) return UNCLEAR
+              if (entry.size != null && entry.size > 4 * MAX_FILE_CHARS) return UNCLEAR
               return fetchBlob(entry.sha)
             }
 
@@ -766,7 +767,7 @@ jobs:
               return data.resolveReviewThread.thread.isResolved
             }
 
-            const outcome = { candidates: 0, llm_calls: 0, resolved: 0, would_resolve: 0, deferred: 0, already_resolved: 0, jev_resolved: 0, jev_present: 0, jev_uncertain: 0, jev_escalated: 0, jev_input_tokens: 0, skipped: [], failures: 0 }
+            const outcome = { candidates: 0, llm_calls: 0, resolved: 0, structural_resolved: 0, would_resolve: 0, deferred: 0, already_resolved: 0, jev_resolved: 0, jev_present: 0, jev_uncertain: 0, jev_escalated: 0, jev_input_tokens: 0, skipped: [], failures: 0 }
 
             // Stage 1 of the two-stage gate: batched Noul screen over every candidate whose
             // head file is readable. Returns a Map candidate-id -> { noul, band } where
@@ -802,14 +803,19 @@ jobs:
               console.log(`[verdict-sweeper] jev screen: ${batchList.reduce((s, [, cs]) => s + cs.length, 0)} candidates in ${batchList.length} file batches (${JEV_MODEL})`)
               let ji = 0
               let failures = 0
+              let budgetStopped = false
+              let batchesDone = 0
               await Promise.all(
                 Array.from({ length: JEV_CONCURRENCY }, async () => {
                   for (;;) {
+                    if (budgetStopped) return
                     const i = ji++
                     if (i >= batchList.length) return
                     if (Date.now() - startedAt > WALL_BUDGET_MS) {
-                      const remaining = batchList.slice(i).reduce((s, [, cs]) => s + cs.length, 0)
-                      console.log(`[verdict-sweeper] wall-clock budget reached during the jev screen; ${remaining} candidates skip the screen and go to the reasoning LLM`)
+                      // Shared stop flag: both workers see it, so the remaining count is
+                      // computed once after the loop instead of per-worker (which
+                      // double-counted overlapping slices).
+                      budgetStopped = true
                       return
                     }
                     const [path, cs] = batchList[i]
@@ -873,10 +879,15 @@ jobs:
                       failures++
                       console.log(`[verdict-sweeper] jev screen FAIL ${path} (${cs.length} candidates): ${e.message} — they fall through to the reasoning LLM`)
                     }
+                    batchesDone++
                     await sleep(JEV_PACE_MS)
                   }
                 })
               )
+              if (budgetStopped) {
+                const remaining = batchList.slice(batchesDone).reduce((s, [, cs]) => s + cs.length, 0)
+                console.log(`[verdict-sweeper] wall-clock budget reached during the jev screen; ${remaining} candidates skip the screen and go to the reasoning LLM`)
+              }
               // Severity format drift: if most candidates have no parseable badge, an
               // upstream comment-format change is silently converting every thread into a
               // paid stage-2 call — say so loudly instead of failing quietly.
@@ -943,12 +954,12 @@ jobs:
               if (worstCaseMs > WALL_BUDGET_MS) {
                 console.log(`[verdict-sweeper] warning: VERDICT_MAX_THREADS=${MAX_THREADS} worst case (~${Math.round(worstCaseMs / 60000)} min) exceeds the ${WALL_BUDGET_MS / 60000}-min wall budget; expect deferred candidates every run — lower MAX_THREADS or raise VERDICT_WALL_BUDGET_MIN`)
               }
-              // The wall budget shares the job's 45-minute ceiling with the review step
-              // that runs first (up to ~30 min historically). A budget above ~40 min can
-              // get the job killed mid-resolve — keep the ceiling comment and this guard
-              // in sync if the job timeout changes.
-              if (WALL_BUDGET_MS > 40 * 60000) {
-                console.log(`[verdict-sweeper] warning: VERDICT_WALL_BUDGET_MIN=${WALL_BUDGET_MS / 60000} exceeds the ~40 min safely available under the 45-min job ceiling (the review step runs first); the job may be killed mid-resolve`)
+              // The wall budget shares the job's 55-minute ceiling with the review step
+              // that runs first (up to ~30 min historically). A budget above ~25 min can
+              // overlap the worst-case review — keep this guard in sync if the job
+              // timeout changes (the default 25 sits exactly on that line).
+              if (WALL_BUDGET_MS > 25 * 60000) {
+                console.log(`[verdict-sweeper] warning: VERDICT_WALL_BUDGET_MIN=${WALL_BUDGET_MS / 60000} exceeds the ~25 min that fits alongside a worst-case review under the 55-min job ceiling; the job may be killed mid-resolve`)
               }
               for (let i = 0; i < selected.length; i++) {
                 const c = selected[i]
@@ -971,7 +982,7 @@ jobs:
                     }
                     await sleep(DELAY_MS)
                     const ok = await resolveThread(c.id)
-                    if (ok) { console.log(`[verdict-sweeper] resolved ${c.path} (path absent from head tree): "${short}"`); outcome.resolved++ }
+                    if (ok) { console.log(`[verdict-sweeper] resolved ${c.path} (path absent from head tree): "${short}"`); outcome.resolved++; outcome.structural_resolved++ }
                     else { console.log(`[verdict-sweeper] ${c.path}: thread already resolved elsewhere or no longer resolvable (concurrent run?); not counted as a failure`); outcome.already_resolved++ }
                     continue
                   }
@@ -1068,7 +1079,7 @@ jobs:
               // once with VERDICT_DRY_RUN unset on a scratch PR — or watch the first real
               // run's `resolved=` / `already_resolved=` counters — to confirm the token's
               // contents:write scope actually allows the mutation.
-              console.log(`[verdict-sweeper] done candidates=${outcome.candidates} ${DRY_RUN ? `would_resolve=${outcome.would_resolve}` : `resolved=${outcome.resolved} (jev=${outcome.jev_resolved}, glm=${outcome.llm_calls ? outcome.resolved - outcome.jev_resolved : 0})`} llm_calls=${outcome.llm_calls} jev_screened=${screen.size} jev_present=${outcome.jev_present} jev_uncertain=${outcome.jev_uncertain} jev_escalated=${outcome.jev_escalated} jev_tokens=${outcome.jev_input_tokens} already_resolved=${outcome.already_resolved} deferred=${outcome.deferred} unclear_or_present=${outcome.skipped.length} failures=${outcome.failures}${DRY_RUN ? ' (dry-run, nothing mutated)' : ''}`)
+              console.log(`[verdict-sweeper] done candidates=${outcome.candidates} ${DRY_RUN ? `would_resolve=${outcome.would_resolve}` : `resolved=${outcome.resolved} (jev=${outcome.jev_resolved}, glm=${Math.max(0, outcome.resolved - outcome.jev_resolved - outcome.structural_resolved)}, structural=${outcome.structural_resolved})`} llm_calls=${outcome.llm_calls} jev_screened=${screen.size} jev_present=${outcome.jev_present} jev_uncertain=${outcome.jev_uncertain} jev_escalated=${outcome.jev_escalated} jev_tokens=${outcome.jev_input_tokens} already_resolved=${outcome.already_resolved} deferred=${outcome.deferred} unclear_or_present=${outcome.skipped.length} failures=${outcome.failures}${DRY_RUN ? ' (dry-run, nothing mutated)' : ''}`)
             } catch (e) {
               console.error(`[verdict-sweeper] fatal: ${e.message}`)
               process.exit(1)
