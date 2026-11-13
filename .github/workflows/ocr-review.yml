@@ -98,8 +98,9 @@ jobs:
         # unresolved OCR-owned thread, whether the finding still holds against the
         # CURRENT head version of the file, and resolves it on a confident "fixed"
         # whose evidence quote is verified verbatim against that file.
-        # Fail-closed: human-replied threads, non-OCR threads, low confidence,
-        # unclear verdicts, evidence mismatches and any error are all skipped.
+        # Fail-closed: human-replied threads (including replies beyond the first
+        # 100 comments), non-OCR threads, low confidence, unclear verdicts,
+        # evidence mismatches and any error are all skipped.
         # One cheap LLM call per lingering thread, paced by VERDICT_DELAY_MS.
         #
         # FORK GUARD: skipped for PRs from forks — a fork's file content is
@@ -166,9 +167,11 @@ jobs:
             const LLM_URL = (process.env.OCR_LLM_URL || '').replace(/\/+$/, '')
             const LLM_TOKEN = process.env.OCR_LLM_TOKEN || ''
             const LLM_MODEL = process.env.OCR_LLM_MODEL || ''
-            const MAX_THREADS = Number(process.env.VERDICT_MAX_THREADS || 25)
-            const DELAY_MS = Number(process.env.VERDICT_DELAY_MS || 800)
+            const MAX_THREADS_RAW = Number(process.env.VERDICT_MAX_THREADS || 25)
+            const DELAY_MS_RAW = Number(process.env.VERDICT_DELAY_MS || 800)
             const MAX_FILE_CHARS = 60000
+            const GH_TIMEOUT_MS = 30000   // GitHub API calls
+            const LLM_TIMEOUT_MS = 120000 // thinking-model verdicts legitimately run long
 
             if (!REPO || !PR_NUMBER || !HEAD_SHA) {
               console.error('[verdict-sweeper] OCR_REPOSITORY / OCR_PR_NUMBER / OCR_HEAD_SHA are required')
@@ -187,9 +190,21 @@ jobs:
 
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+            // Fail fast on non-finite numeric config instead of NaN silently disabling
+            // the cap (candidates.slice(0, NaN) === []) or the pacing (sleep(NaN) = no-op).
+            const MAX_THREADS = Number.isFinite(MAX_THREADS_RAW) && MAX_THREADS_RAW > 0 ? MAX_THREADS_RAW : 25
+            const DELAY_MS = Number.isFinite(DELAY_MS_RAW) && DELAY_MS_RAW >= 0 ? DELAY_MS_RAW : 800
+            if (MAX_THREADS_RAW !== MAX_THREADS) {
+              console.log(`[verdict-sweeper] VERDICT_MAX_THREADS="${process.env.VERDICT_MAX_THREADS}" is not a positive number; using default ${MAX_THREADS}`)
+            }
+            if (DELAY_MS_RAW !== DELAY_MS) {
+              console.log(`[verdict-sweeper] VERDICT_DELAY_MS="${process.env.VERDICT_DELAY_MS}" is not a non-negative number; using default ${DELAY_MS}`)
+            }
+
             async function gql(query, variables = {}) {
               const res = await fetch('https://api.github.com/graphql', {
                 method: 'POST',
+                signal: AbortSignal.timeout(GH_TIMEOUT_MS),
                 headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ query, variables }),
               })
@@ -202,6 +217,7 @@ jobs:
 
             async function rest(path, accept) {
               const res = await fetch(`https://api.github.com${path}`, {
+                signal: AbortSignal.timeout(GH_TIMEOUT_MS),
                 headers: { Authorization: `Bearer ${TOKEN}`, Accept: accept || 'application/vnd.github+json' },
               })
               if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`)
@@ -209,11 +225,12 @@ jobs:
             }
 
             // Ownership marker: OCR tags every inline comment it posts with a per-run HTML
-            // comment. Observed formats on real PRs:
+            // comment, as the FIRST thing in the body. Observed formats on real PRs:
             //   inline:   <!-- ocr-43487464466-1-fa6dc4387a4c2473 -->
             //   summary:  <!-- ocr-summary-run:43455882475-1 -->
-            // Match any HTML comment that starts with "ocr" followed by a separator.
-            const OCR_MARKER_RE = /<!--\s*ocr[-_:]/
+            // Anchor to the start of the body: a third-party bot or a code sample whose
+            // body merely CONTAINS an ocr-like comment is not OCR ownership.
+            const OCR_MARKER_RE = /^\s*<!--\s*ocr[-_:]/
             const BOT_LOGINS = new Set(['github-actions']) // GITHUB_TOKEN identity, no [bot] suffix in GraphQL
 
             function isBotLogin(login) {
@@ -227,9 +244,15 @@ jobs:
 
             async function fetchHeadTree() {
               const tree = await rest(`/repos/${REPO}/git/trees/${HEAD_SHA}?recursive=1`)
-              if (tree.truncated_state === 'true' || tree.truncated === true) {
+              // `truncated` is the documented git-trees signal. If the shape ever changes,
+              // treat the tree as complete would be dangerous — so check only the known
+              // field and log anything unexpected rather than guessing.
+              if (tree.truncated === true) {
                 console.log('[verdict-sweeper] warning: head tree is truncated; missing paths will be judged unclear, not deleted')
                 return { entries: new Map(tree.tree.map((e) => [e.path, e])), complete: false }
+              }
+              if (tree.truncated !== undefined && tree.truncated !== false) {
+                console.log(`[verdict-sweeper] warning: unexpected git-trees truncation field: ${JSON.stringify(tree.truncated)}`)
               }
               return { entries: new Map(tree.tree.map((e) => [e.path, e])), complete: true }
             }
@@ -306,7 +329,11 @@ jobs:
                   if (!first || !isBotLogin(login) || !OCR_MARKER_RE.test(first.body)) {
                     skipped.not_ocr++; continue
                   }
-                  const humanReply = t.comments.nodes.some((c) => !isBotLogin(c.author?.login || ''))
+                  const humanReply = t.comments.totalCount > t.comments.nodes.length ||
+                    t.comments.nodes.some((c) => !isBotLogin(c.author?.login || ''))
+                  // totalCount beyond the fetched page means replies we cannot see — a
+                  // human may have joined beyond comment 100, so the thread is not safe
+                  // to resolve without seeing the whole conversation.
                   if (humanReply) { skipped.human_replied++; continue }
                   // Strip marker comments and shields.io severity badges; keep the prose finding.
                   const finding = first.body
@@ -367,6 +394,7 @@ jobs:
 
               const res = await fetch(`${LLM_URL}/chat/completions`, {
                 method: 'POST',
+                signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
                 headers: {
                   Authorization: `Bearer ${LLM_TOKEN}`,
                   'Content-Type': 'application/json',
@@ -398,8 +426,18 @@ jobs:
               // an exact quote that actually occurs in the head file content. This is a hard
               // check against the file, not the model's word — instructions planted inside the
               // file cannot fabricate proof of a fix; they can only be quoted back.
+              //
+              // Residual risk, accepted and documented: containment proves the quote exists,
+              // not that it proves the fix. Two mechanical strengthenings: a minimum length
+              // (a one-word quote is noise), and the evidence must NOT be a substring of the
+              // finding itself — proof of a fix is the NEW code, not the flagged line quoted
+              // back from the review text. The remaining judgment ("does this quote show the
+              // problem is gone?") is the model's, which is the point of the sweeper; the
+              // merge gate still adjudicates anything a human disagrees with.
               if (v === 'fixed' && conf === 'high') {
                 if (!evidence) throw new Error('fixed/high without evidence quote')
+                if (evidence.length < 12) throw new Error(`evidence quote too short to prove a fix: "${evidence.slice(0, 40)}"`)
+                if (finding.includes(evidence)) throw new Error(`evidence quote is copied from the finding, not the fixed code: "${evidence.slice(0, 60)}"`)
                 if (!content.includes(evidence)) throw new Error(`evidence quote not found in head file: "${evidence.slice(0, 80)}"`)
               }
               return { verdict: v, confidence: conf, evidence }
