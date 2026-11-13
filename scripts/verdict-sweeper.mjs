@@ -39,6 +39,10 @@ if (!REPO || !PR_NUMBER || !HEAD_SHA) {
   console.error('[verdict-sweeper] OCR_REPOSITORY / OCR_PR_NUMBER / OCR_HEAD_SHA are required')
   process.exit(1)
 }
+if (!LLM_URL || !LLM_TOKEN || !LLM_MODEL) {
+  console.error('[verdict-sweeper] OCR_LLM_URL / OCR_LLM_TOKEN / OCR_LLM_MODEL are required — failing fast instead of per-thread')
+  process.exit(1)
+}
 
 const TOKEN = process.env.GITHUB_TOKEN
 if (!TOKEN) {
@@ -74,47 +78,70 @@ function isBotLogin(login) {
 }
 
 async function listCandidates() {
-  const data = await gql(
-    `query($owner: String!, $name: String!, $number: Int!) {
-      repository(owner: $owner, name: $name) {
-        pullRequest(number: $number) {
-          reviewThreads(first: 100) {
-            nodes {
-              id
-              isResolved
-              path
-              comments(first: 100) {
-                totalCount
-                nodes { author { login } body }
+  const candidates = []
+  const skipped = { resolved: 0, not_ocr: 0, human_replied: 0 }
+  let cursor = null
+  let counted = 0
+  let truncated = false
+  // Paginate: a PR can have more than 100 threads, and silently missing the
+  // rest would be exactly the staleness this sweeper exists to clear.
+  while (true) {
+    const data = await gql(
+      `query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $number) {
+            reviewThreads(first: 100, after: $cursor) {
+              totalCount
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                id
+                isResolved
+                path
+                comments(first: 100) {
+                  totalCount
+                  nodes { author { login } body }
+                }
               }
             }
           }
         }
+      }`,
+      { owner: REPO.split('/')[0], name: REPO.split('/')[1], number: PR_NUMBER, cursor }
+    )
+    const conn = data.repository.pullRequest.reviewThreads
+    counted = conn.totalCount
+    for (const t of conn.nodes) {
+      if (t.isResolved) { skipped.resolved++; continue }
+      const first = t.comments.nodes[0]
+      const login = first?.author?.login || ''
+      if (!first || !isBotLogin(login) || !OCR_MARKER_RE.test(first.body)) {
+        skipped.not_ocr++; continue
       }
-    }`,
-    { owner: REPO.split('/')[0], name: REPO.split('/')[1], number: PR_NUMBER }
-  )
-  const threads = data.repository.pullRequest.reviewThreads.nodes
-  const candidates = []
-  const skipped = { resolved: 0, not_ocr: 0, human_replied: 0 }
-  for (const t of threads) {
-    if (t.isResolved) { skipped.resolved++; continue }
-    const first = t.comments.nodes[0]
-    const login = first?.author?.login || ''
-    if (!first || !isBotLogin(login) || !OCR_MARKER_RE.test(first.body)) {
-      skipped.not_ocr++; continue
+      const humanReply = t.comments.nodes.some((c) => !isBotLogin(c.author?.login || ''))
+      if (humanReply) { skipped.human_replied++; continue }
+      // Strip marker comments and shields.io severity badges; keep the prose finding.
+      const finding = first.body
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/!\[[^\]]*\]\(https:\/\/img\.shields\.io[^)]*\)/g, '')
+        .trim()
+      candidates.push({ id: t.id, path: t.path, finding })
     }
-    const humanReply = t.comments.nodes.some((c) => !isBotLogin(c.author?.login || ''))
-    if (humanReply) { skipped.human_replied++; continue }
-    // Strip marker comments and shields.io severity badges; keep the prose finding.
-    const finding = first.body
-      .replace(/<!--[\s\S]*?-->/g, '')
-      .replace(/!\[[^\]]*\]\(https:\/\/img\.shields\.io[^)]*\)/g, '')
-      .trim()
-    candidates.push({ id: t.id, path: t.path, finding })
+    if (!conn.pageInfo.hasNextPage || !conn.pageInfo.endCursor) {
+      truncated = conn.pageInfo.hasNextPage && !conn.pageInfo.endCursor
+      break
+    }
+    cursor = conn.pageInfo.endCursor
   }
-  return { candidates, skipped, total: threads.length }
+  if (truncated) {
+    console.log(`[verdict-sweeper] warning: thread listing truncated (cursor missing); ${candidates.length} of ${counted} threads seen`)
+  }
+  return { candidates, skipped, total: counted }
 }
+
+// Sentinel: the file exists but is too large to judge reliably. A truncated
+// file must produce "unclear", never "fixed" — resolution is destructive and
+// a partial view could hide the very code the finding is about.
+const FILE_TOO_LARGE = Symbol('file-too-large')
 
 async function headFile(path) {
   const url = `https://api.github.com/repos/${REPO}/contents/${encodeURIComponent(path)}?ref=${HEAD_SHA}`
@@ -125,7 +152,8 @@ async function headFile(path) {
   if (!res.ok) throw new Error(`contents ${path}: HTTP ${res.status}`)
   const text = await res.text()
   if (text.length > MAX_FILE_CHARS) {
-    return text.slice(0, MAX_FILE_CHARS) + `\n\n[... truncated at ${MAX_FILE_CHARS} chars]`
+    console.log(`[verdict-sweeper] ${path}: file exceeds ${MAX_FILE_CHARS} chars, skipping (fail-closed)`)
+    return FILE_TOO_LARGE
   }
   return text
 }
@@ -184,7 +212,7 @@ async function resolveThread(id) {
   return data.resolveReviewThread.thread.isResolved
 }
 
-const outcome = { candidates: 0, llm_calls: 0, resolved: 0, skipped: [], failures: 0 }
+const outcome = { candidates: 0, llm_calls: 0, resolved: 0, would_resolve: 0, skipped: [], failures: 0 }
 
 try {
   const { candidates, skipped, total } = await listCandidates()
@@ -197,9 +225,16 @@ try {
       const content = await headFile(c.path)
       if (content === null) {
         // The whole file was deleted in head — the finding cannot apply anymore.
-        if (DRY_RUN) { console.log(`[verdict-sweeper] ${c.path}: file deleted, would resolve "${short}"`); outcome.resolved++; continue }
+        if (DRY_RUN) { console.log(`[verdict-sweeper] ${c.path}: file deleted, would resolve "${short}"`); outcome.would_resolve++; continue }
         const ok = await resolveThread(c.id)
         if (ok) { console.log(`[verdict-sweeper] resolved ${c.path} (file deleted): "${short}"`); outcome.resolved++ }
+        continue
+      }
+      if (content === FILE_TOO_LARGE) {
+        // Fail-closed: a partial file view could hide the problem the finding
+        // describes, so an oversized file can never earn a "fixed" verdict.
+        console.log(`[verdict-sweeper] skipped ${c.path} (file too large): "${short}"`)
+        outcome.skipped.push(`${c.path}: unclear/file_too_large`)
         continue
       }
       await sleep(DELAY_MS)
@@ -208,7 +243,7 @@ try {
       if (v.verdict === 'fixed' && v.confidence === 'high') {
         if (DRY_RUN) {
           console.log(`[verdict-sweeper] ${c.path}: verdict=fixed/high, would resolve "${short}"`)
-          outcome.resolved++
+          outcome.would_resolve++
         } else {
           const ok = await resolveThread(c.id)
           if (ok) { console.log(`[verdict-sweeper] resolved ${c.path} (verdict=fixed/high): "${short}"`); outcome.resolved++ }
@@ -224,7 +259,7 @@ try {
     }
   }
 
-  console.log(`[verdict-sweeper] done candidates=${outcome.candidates} llm_calls=${outcome.llm_calls} resolved=${outcome.resolved} unclear_or_present=${outcome.skipped.length} failures=${outcome.failures}${DRY_RUN ? ' (dry-run, nothing mutated)' : ''}`)
+  console.log(`[verdict-sweeper] done candidates=${outcome.candidates} llm_calls=${outcome.llm_calls} ${DRY_RUN ? `would_resolve=${outcome.would_resolve}` : `resolved=${outcome.resolved}`} unclear_or_present=${outcome.skipped.length} failures=${outcome.failures}${DRY_RUN ? ' (dry-run, nothing mutated)' : ''}`)
 } catch (e) {
   console.error(`[verdict-sweeper] fatal: ${e.message}`)
   process.exit(1)
