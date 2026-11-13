@@ -107,8 +107,6 @@ jobs:
         # unclear verdicts, evidence mismatches, a moved PR head, and any error
         # are all skipped. One cheap LLM call per lingering thread, paced by
         # VERDICT_DELAY_MS, bounded by VERDICT_WALL_BUDGET_MIN.
-        # Set the repo variable VERDICT_DRY_RUN=true to validate against live
-        # PRs without mutating anything.
         #
         # FORK GUARD: skipped for PRs from forks — a fork's file content is
         # attacker-controlled input to the verdict LLM (prompt-injection
@@ -131,6 +129,12 @@ jobs:
           OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
           OCR_LLM_TOKEN: ${{ secrets.OCR_LLM_TOKEN }}
           OCR_LLM_MODEL: ${{ secrets.OCR_LLM_MODEL }}
+          # Per-repo knobs (optional, default in the script): set repo variables
+          # to override. VERDICT_DRY_RUN=true validates without resolving.
+          VERDICT_DRY_RUN: ${{ vars.VERDICT_DRY_RUN }}
+          VERDICT_MAX_THREADS: ${{ vars.VERDICT_MAX_THREADS }}
+          VERDICT_DELAY_MS: ${{ vars.VERDICT_DELAY_MS }}
+          VERDICT_WALL_BUDGET_MIN: ${{ vars.VERDICT_WALL_BUDGET_MIN }}
           SWEEPER_SCRIPT: |
             // verdict-sweeper — resolve OCR review threads whose finding no longer exists in the head code.
             //
@@ -649,10 +653,11 @@ jobs:
               const tree = await treeAt(commitSha)
               const entry = tree.entries.get(path)
               if (!entry) return tree.complete ? null : UNCLEAR
-              // Same guards as headFile: symlinks are blobs whose content is the target
-              // path string, and submodules are commits — neither is evidence-grade text.
+              // Same guards and byte pre-filter as headFile: symlinks are blobs whose
+              // content is the target path string, submodules are commits, and the
+              // 2x-byte conservative filter keeps both lookups consistent.
               if (entry.type !== 'blob' || entry.mode === '120000' || entry.mode === '160000') return UNCLEAR
-              if (entry.size != null && entry.size > MAX_FILE_CHARS) return UNCLEAR
+              if (entry.size != null && entry.size > 2 * MAX_FILE_CHARS) return UNCLEAR
               return fetchBlob(entry.sha)
             }
 
@@ -693,14 +698,14 @@ jobs:
               const headMoved = currentHead !== HEAD_SHA
               if (headMoved) {
                 console.log(`[verdict-sweeper] head moved during the run (${HEAD_SHA.slice(0, 7)}..${currentHead.slice(0, 7)}); skipping all resolutions — the next run re-judges against the new head`)
-                outcome.deferred = candidates.length // everything waits for the next run
               }
 
               const startedAt = Date.now()
-              const deferred = Math.max(0, candidates.length - MAX_THREADS)
-              if (deferred > 0) {
-                outcome.deferred = deferred
-                console.log(`[verdict-sweeper] deferring ${deferred} candidates beyond VERDICT_MAX_THREADS=${MAX_THREADS} — they stay open for a later run`)
+              // Everything not processed this run is deferred; when the head moved that is
+              // ALL candidates (they are re-judged against the new head next run).
+              outcome.deferred = headMoved ? candidates.length : Math.max(0, candidates.length - MAX_THREADS)
+              if (outcome.deferred > 0) {
+                console.log(`[verdict-sweeper] deferring ${outcome.deferred} candidates${headMoved ? ' (head moved)' : ` beyond VERDICT_MAX_THREADS=${MAX_THREADS}`} — they stay open for a later run`)
               }
 
               const selected = headMoved ? [] : candidates.slice(0, MAX_THREADS)
