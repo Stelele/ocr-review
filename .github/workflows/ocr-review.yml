@@ -100,8 +100,8 @@ jobs:
         # whose evidence quote is verified verbatim against that file AND shown to
         # be new code (absent from the base version).
         # Fail-closed: human-replied threads (including replies beyond the first
-        # 100 comments), non-OCR threads, low confidence, unclear verdicts,
-        # evidence mismatches and any error are all skipped.
+        # 100 comments or a hasNextPage), non-OCR threads, low confidence,
+        # unclear verdicts, evidence mismatches and any error are all skipped.
         # One cheap LLM call per lingering thread, paced by VERDICT_DELAY_MS.
         #
         # FORK GUARD: skipped for PRs from forks — a fork's file content is
@@ -159,6 +159,15 @@ jobs:
             // Optional: VERDICT_MAX_THREADS (default 25 per run), VERDICT_DELAY_MS (default 800).
             //
             // Usage: node verdict-sweeper.mjs [--dry-run]
+
+            // Node >= 18 required: global fetch, AbortSignal.timeout, String.matchAll.
+            // A syntax-valid script on an old node would die at runtime with
+            // "fetch is not defined" — a fatal that continue-on-error swallows, so say
+            // exactly what is wrong instead.
+            if (typeof fetch !== 'function' || typeof AbortSignal?.timeout !== 'function') {
+              console.error('[verdict-sweeper] node >= 18 is required (global fetch and AbortSignal.timeout are missing); got ' + process.version)
+              process.exit(1)
+            }
 
             const args = process.argv.slice(2)
             const DRY_RUN = args.includes('--dry-run')
@@ -227,13 +236,30 @@ jobs:
               return body.data
             }
 
+            async function sleepAndRetry(attempt, res) {
+              // Honor Retry-After when GitHub sends it on 429; otherwise exponential-ish backoff.
+              let ms = attempt * 1000
+              if (res) {
+                const ra = res.headers?.get?.('retry-after')
+                if (ra && Number.isFinite(Number(ra))) ms = Math.max(ms, Number(ra) * 1000)
+              }
+              await sleep(ms + Math.floor(Math.random() * 250))
+            }
+
             async function rest(path, accept) {
-              const res = await fetch(`https://api.github.com${path}`, {
-                signal: AbortSignal.timeout(GH_TIMEOUT_MS),
-                headers: { Authorization: `Bearer ${TOKEN}`, Accept: accept || 'application/vnd.github+json' },
-              })
-              if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`)
-              return res.json()
+              let last
+              for (let attempt = 0; attempt < 3; attempt++) {
+                if (attempt > 0) await sleepAndRetry(attempt, last)
+                const res = await fetch(`https://api.github.com${path}`, {
+                  signal: AbortSignal.timeout(GH_TIMEOUT_MS),
+                  headers: { Authorization: `Bearer ${TOKEN}`, Accept: accept || 'application/vnd.github+json' },
+                })
+                if (res.ok) return res.json()
+                last = res
+                // Retry transient failures only: rate limits and server errors.
+                if (res.status !== 429 && res.status < 500) break
+              }
+              throw new Error(`${path}: HTTP ${last.status}`)
             }
 
             // Ownership marker: OCR tags every inline comment it posts with a per-run HTML
@@ -281,13 +307,17 @@ jobs:
                 // location re-reports the finding there if it still applies.
                 return tree.complete ? null : UNCLEAR
               }
-              if (entry.type !== 'blob') {
-                // Directory/symlink: not plain file content, cannot judge.
-                console.log(`[verdict-sweeper] ${path}: head entry is ${entry.type}, not a blob; skipping`)
+              if (entry.type !== 'blob' || entry.mode === '120000' || entry.mode === '160000') {
+                // Directory, symlink (a symlink IS a blob with mode 120000 — its "content"
+                // is the target path string, not file content), or submodule: cannot judge.
+                console.log(`[verdict-sweeper] ${path}: head entry is ${entry.type}/mode ${entry.mode}, not a regular file; skipping`)
                 return UNCLEAR
               }
-              if (entry.size != null && entry.size > MAX_FILE_CHARS) {
-                console.log(`[verdict-sweeper] ${path}: ${entry.size} bytes exceeds the ${MAX_FILE_CHARS} limit, skipping (fail-closed)`)
+              // entry.size is BYTES. UTF-8 needs at most 4 bytes per char, so size above
+              // 2x the char budget guarantees an oversized file; sizes between the budgets
+              // are checked exactly after decode (fetchBlob is authoritative).
+              if (entry.size != null && entry.size > 2 * MAX_FILE_CHARS) {
+                console.log(`[verdict-sweeper] ${path}: ${entry.size} bytes exceeds the ${MAX_FILE_CHARS} char budget, skipping (fail-closed)`)
                 return UNCLEAR
               }
               if (BINARYISH_RE.test(path) || GENERATED_RE.test(path)) {
@@ -330,6 +360,7 @@ jobs:
                             path
                             comments(first: 100) {
                               totalCount
+                              pageInfo { hasNextPage }
                               nodes { author { login } body }
                             }
                           }
@@ -350,10 +381,11 @@ jobs:
                     skipped.not_ocr++; continue
                   }
                   const humanReply = t.comments.totalCount > t.comments.nodes.length ||
+                    t.comments.pageInfo.hasNextPage === true ||
                     t.comments.nodes.some((c) => !isBotLogin(c.author?.login || ''))
-                  // totalCount beyond the fetched page means replies we cannot see — a
-                  // human may have joined beyond comment 100, so the thread is not safe
-                  // to resolve without seeing the whole conversation.
+                  // totalCount beyond the fetched page, or an explicit hasNextPage, means
+                  // replies we cannot see — a human may have joined beyond comment 100, so
+                  // the thread is not safe to resolve without seeing the whole conversation.
                   if (humanReply) { skipped.human_replied++; continue }
                   // Strip marker comments and shields.io severity badges; keep the prose finding.
                   const finding = first.body
@@ -377,16 +409,18 @@ jobs:
 
             // The review LLM is a thinking model: its content may wrap the verdict JSON in
             // reasoning or fences. Try, in order: fenced code blocks, the whole text, then
-            // every flat {...} fragment. Accept the first object that parses AND carries a
-            // verdict field; anything else is a hard error (fail-closed).
+            // every flat {...} fragment. Flat fragments are scanned BACK TO FRONT and the
+            // last object that parses AND carries a verdict field wins — the final answer
+            // in a thinking-model response comes last, and incidental reasoning snippets
+            // must not shadow it. Nothing parses: hard error (fail-closed).
             function extractVerdictJson(text) {
-              const tries = []
+              const candidates = []
               const fenced = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)]
-              for (const f of fenced) tries.push(f[1].trim())
-              tries.push(text.trim())
+              for (const f of fenced) candidates.push(f[1].trim())
+              candidates.push(text.trim())
               const flat = text.match(/\{[^{}]*\}/g)
-              if (flat) tries.push(...flat)
-              for (const t of tries) {
+              if (flat) candidates.push(...flat.reverse())
+              for (const t of candidates) {
                 try {
                   const o = JSON.parse(t)
                   if (o && typeof o === 'object' && !Array.isArray(o) && 'verdict' in o) return o
@@ -429,8 +463,39 @@ jobs:
                   ],
                 }),
               })
+              if (!res.ok && (res.status === 429 || res.status >= 500)) {
+                // One bounded retry for transient LLM failures; beyond that, fail closed.
+                await sleepAndRetry(2, res)
+                const retry = await fetch(`${LLM_URL}/chat/completions`, {
+                  method: 'POST',
+                  signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+                  headers: {
+                    Authorization: `Bearer ${LLM_TOKEN}`,
+                    'Content-Type': 'application/json',
+                    'x-opencode-session': 'verdict-sweeper',
+                  },
+                  body: JSON.stringify({
+                    model: LLM_MODEL,
+                    temperature: 0,
+                    messages: [
+                      { role: 'system', content: system },
+                      { role: 'user', content: user },
+                    ],
+                  }),
+                })
+                if (!retry.ok) throw new Error(`llm HTTP ${retry.status} (after 1 retry)`)
+                return finishVerdict(await retry.json())
+              }
               if (!res.ok) throw new Error(`llm HTTP ${res.status}`)
-              const body = await res.json()
+              return finishVerdict(await res.json(), finding, path, content)
+            }
+
+            // Validate and gate the LLM's verdict object. Prefer the LAST parseable
+            // fragment carrying a verdict: thinking models put their final answer at the
+            // end, and reasoning can contain incidental {...} snippets that would
+            // otherwise shadow it (extractVerdictJson therefore walks candidates in a
+            // last-match-preferring order — see below).
+            async function finishVerdict(body, finding, path, content) {
               const text = body.choices?.[0]?.message?.content || ''
               const parsed = extractVerdictJson(text)
               const v = parsed.verdict
