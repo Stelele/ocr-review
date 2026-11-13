@@ -97,20 +97,29 @@ jobs:
       - name: Resolve findings fixed in the head code (verdict sweeper)
         # resolve_outdated above only resolves threads whose lines LEFT the diff;
         # a fix that rewrites the commented lines in place never becomes outdated,
-        # so those threads would stay open forever. This step asks the LLM, per
-        # unresolved OCR-owned thread, whether the finding still holds against the
-        # CURRENT head version of the file, and resolves it on a confident "fixed"
-        # whose evidence quote is verified verbatim against that file AND shown to
-        # be new code (absent at the true merge-base, not just the base tip).
+        # so those threads would stay open forever. Two-stage resolution:
+        #
+        #   Stage 1 (opt-in per repo: set the VERDICT_JEV_SCREEN variable to
+        #   "true"): a calibrated Noul screen (jev via the System One endpoint,
+        #   which shares this repo's OCR_LLM_TOKEN secret) judges every
+        #   unresolved thread against the current head file in ONE batched
+        #   request per file. Measured on 608 real threads: zero false
+        #   resolves below noul 0.2. noul < VERDICT_JEV_RESOLVE_BELOW and the
+        #   file changed vs merge-base -> resolve without a reasoning-LLM
+        #   call; noul > VERDICT_JEV_PRESENT_ABOVE -> keep open without one.
+        #   On a 594-thread backlog replay this decided 70% of threads in
+        #   0.8 minutes at zero cost.
+        #
+        #   Stage 2 (always available, unchanged): the reasoning LLM judges the
+        #   uncertain band and everything the screen could not read, with the
+        #   evidence-quote gate described below.
+        #
         # Fail-closed: human-replied threads (including replies beyond the first
         # 100 comments or a hasNextPage), non-OCR threads, low confidence,
-        # unclear verdicts, evidence mismatches, a moved PR head, and any error
-        # are all skipped. One cheap LLM call per lingering thread, paced by
-        # VERDICT_DELAY_MS, bounded by VERDICT_WALL_BUDGET_MIN.
-        #
-        # FORK GUARD: skipped for PRs from forks — a fork's file content is
-        # attacker-controlled input to the verdict LLM (prompt-injection
-        # surface feeding a destructive resolve mutation). Same-repo PRs only.
+        # unclear verdicts, evidence mismatches, a moved PR head, any Jev or LLM
+        # error (screen failures fall through to stage 2), and any error are all
+        # skipped. Fork PRs are skipped entirely — a fork's file content is
+        # attacker-controlled input to both judge models.
         if: github.event.pull_request.head.repo.full_name == github.repository
         #
         # The script is INLINED below rather than fetched from this repo: the
@@ -129,12 +138,19 @@ jobs:
           OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
           OCR_LLM_TOKEN: ${{ secrets.OCR_LLM_TOKEN }}
           OCR_LLM_MODEL: ${{ secrets.OCR_LLM_MODEL }}
-          # Per-repo knobs (optional, default in the script): set repo variables
-          # to override. VERDICT_DRY_RUN=true validates without resolving.
+          # Per-repo knobs (optional, defaults in the script). VERDICT_JEV_SCREEN
+          # = "true" enables the stage-1 Noul screen; VERDICT_DRY_RUN = "true"
+          # validates without resolving.
           VERDICT_DRY_RUN: ${{ vars.VERDICT_DRY_RUN }}
           VERDICT_MAX_THREADS: ${{ vars.VERDICT_MAX_THREADS }}
           VERDICT_DELAY_MS: ${{ vars.VERDICT_DELAY_MS }}
           VERDICT_WALL_BUDGET_MIN: ${{ vars.VERDICT_WALL_BUDGET_MIN }}
+          VERDICT_JEV_SCREEN: ${{ vars.VERDICT_JEV_SCREEN }}
+          VERDICT_JEV_RESOLVE_BELOW: ${{ vars.VERDICT_JEV_RESOLVE_BELOW }}
+          VERDICT_JEV_PRESENT_ABOVE: ${{ vars.VERDICT_JEV_PRESENT_ABOVE }}
+          JEV_MODEL: ${{ vars.JEV_MODEL }}
+          JEV_URL: ${{ vars.JEV_URL }}
+          JEV_TOKEN: ${{ secrets.OCR_LLM_TOKEN }}
           SWEEPER_SCRIPT: |
             // verdict-sweeper — resolve OCR review threads whose finding no longer exists in the head code.
             //
@@ -196,6 +212,24 @@ jobs:
             const GH_TIMEOUT_MS = 30000   // GitHub API calls
             const LLM_TIMEOUT_MS = 120000 // thinking-model verdicts legitimately run long
 
+            // --- two-stage gate: Jev noul screen (per-repo opt-in) ---
+            // Stage 1 is a calibrated yes/no screen (jev via the System One endpoint, which
+            // shares the OpenCode key by default). Resolve only when noul < RESOLVE_BELOW
+            // (calibration on 608 real threads: zero false resolves below 0.2); keep open
+            // when noul > PRESENT_ABOVE; escalate the middle band to the reasoning LLM.
+            // Any Jev failure is fail-closed: those candidates fall through to stage 2.
+            const JEV_SCREEN = process.env.VERDICT_JEV_SCREEN === 'true'
+            const JEV_URL = (process.env.JEV_URL || 'https://opencode.ai/inference/systemone').replace(/\/+$/, '')
+            const JEV_TOKEN = process.env.JEV_TOKEN || process.env.OCR_LLM_TOKEN || ''
+            const JEV_MODEL = process.env.JEV_MODEL || 'jev-1.13-free'
+            const JEV_TIMEOUT_MS = 60000
+            const JEV_RESOLVE_BELOW_RAW = Number(process.env.VERDICT_JEV_RESOLVE_BELOW || 0.2)
+            const JEV_PRESENT_ABOVE_RAW = Number(process.env.VERDICT_JEV_PRESENT_ABOVE || 0.7)
+            const JEV_RESOLVE_BELOW = Number.isFinite(JEV_RESOLVE_BELOW_RAW) && JEV_RESOLVE_BELOW_RAW >= 0 && JEV_RESOLVE_BELOW_RAW <= 1 ? JEV_RESOLVE_BELOW_RAW : 0.2
+            const JEV_PRESENT_ABOVE = Number.isFinite(JEV_PRESENT_ABOVE_RAW) && JEV_PRESENT_ABOVE_RAW >= 0 && JEV_PRESENT_ABOVE_RAW <= 1 ? JEV_PRESENT_ABOVE_RAW : 0.7
+            const JEV_CONCURRENCY = 2
+            const JEV_PACE_MS = 400
+
             // Machine-generated content is never worth an LLM verdict: it bloats tokens and
             // can carry semi-sensitive data. Extension denylist plus well-known lockfiles
             // and minified bundles.
@@ -242,6 +276,15 @@ jobs:
             }
             if (WALL_BUDGET_MIN_RAW !== WALL_BUDGET_MS / 60000) {
               console.log(`[verdict-sweeper] VERDICT_WALL_BUDGET_MIN="${process.env.VERDICT_WALL_BUDGET_MIN}" is not a positive number; using default ${WALL_BUDGET_MS / 60000}`)
+            }
+            if (JEV_SCREEN && JEV_RESOLVE_BELOW_RAW !== JEV_RESOLVE_BELOW) {
+              console.log(`[verdict-sweeper] VERDICT_JEV_RESOLVE_BELOW="${process.env.VERDICT_JEV_RESOLVE_BELOW}" is not a probability in [0,1]; using default ${JEV_RESOLVE_BELOW}`)
+            }
+            if (JEV_SCREEN && JEV_PRESENT_ABOVE_RAW !== JEV_PRESENT_ABOVE) {
+              console.log(`[verdict-sweeper] VERDICT_JEV_PRESENT_ABOVE="${process.env.VERDICT_JEV_PRESENT_ABOVE}" is not a probability in [0,1]; using default ${JEV_PRESENT_ABOVE}`)
+            }
+            if (JEV_SCREEN && !JEV_TOKEN) {
+              console.log('[verdict-sweeper] VERDICT_JEV_SCREEN=true but no JEV_TOKEN/OCR_LLM_TOKEN — screen disabled for this run, all candidates go to the reasoning LLM')
             }
 
             // Backoff between retry attempts; honors Retry-After when GitHub sends it on 429.
@@ -673,7 +716,103 @@ jobs:
               return data.resolveReviewThread.thread.isResolved
             }
 
-            const outcome = { candidates: 0, llm_calls: 0, resolved: 0, would_resolve: 0, deferred: 0, already_resolved: 0, skipped: [], failures: 0 }
+            const outcome = { candidates: 0, llm_calls: 0, resolved: 0, would_resolve: 0, deferred: 0, already_resolved: 0, jev_resolved: 0, jev_present: 0, jev_uncertain: 0, jev_input_tokens: 0, skipped: [], failures: 0 }
+
+            // Stage 1 of the two-stage gate: batched Noul screen over every candidate whose
+            // head file is readable. Returns a Map candidate-id -> { noul, band } where
+            // band is 'resolve' (noul < RESOLVE_BELOW), 'present' (noul > PRESENT_ABOVE) or
+            // 'uncertain' (middle band -> stage 2). Candidates whose Jev call failed are
+            // absent from the map and fall through to stage 2 (fail-closed).
+            // The screen judges only candidates with readable head content — null (verified
+            // deletion) and UNCLEAR candidates keep their existing stage-2/structural paths.
+            async function jevScreen(selected, tree) {
+              const screen = new Map()
+              if (!JEV_SCREEN || !JEV_TOKEN) return screen
+
+              // Group candidates by path: one System One request per file, all its
+              // unresolved threads as parallel Noul questions (the batching that makes the
+              // screen ~free — measured 13 questions in 743 ms on the free tier).
+              const groups = new Map()
+              const contents = new Map()
+              for (const c of selected) {
+                const hit = headFile(tree, c.path)
+                if (hit === null || hit === UNCLEAR) continue // structural/unclear: stage 2 handles them
+                const content = await fetchBlob(hit.sha)
+                if (content === UNCLEAR) continue
+                const key = c.path
+                if (!groups.has(key)) groups.set(key, [])
+                groups.get(key).push(c)
+                contents.set(key, content)
+              }
+
+              const batchList = [...groups.entries()]
+              console.log(`[verdict-sweeper] jev screen: ${batchList.reduce((s, [, cs]) => s + cs.length, 0)} candidates in ${batchList.length} file batches (${JEV_MODEL})`)
+              let ji = 0
+              let failures = 0
+              await Promise.all(
+                Array.from({ length: JEV_CONCURRENCY }, async () => {
+                  for (;;) {
+                    const i = ji++
+                    if (i >= batchList.length) return
+                    const [path, cs] = batchList[i]
+                    const questions = {}
+                    for (const c of cs) {
+                      questions[c.id] = {
+                        type: 'noul',
+                        instructions: {
+                          question:
+                            "A code review finding about a file is given below. Does the problem described in `finding` still exist in the `head_code` provided in the state? Judge the code as written, not the finding's wording.",
+                          finding: c.finding.slice(0, 4000),
+                        },
+                        criteria: {
+                          true: 'the problem described in the finding is still present in `head_code` — the problematic pattern, or a materially equivalent one, remains',
+                          false: '`head_code` clearly shows the problem described in the finding no longer exists (it was removed, replaced with a safe pattern, or made unreachable)',
+                        },
+                      }
+                    }
+                    let lastRes = null
+                    let body = null
+                    try {
+                      for (let attempt = 0; attempt < 3; attempt++) {
+                        if (attempt > 0) {
+                          const ra = lastRes?.headers?.get?.('retry-after')
+                          const ms = ra && Number.isFinite(Number(ra)) ? Number(ra) * 1000 : attempt * 5000
+                          await sleep(ms + Math.floor(Math.random() * 500))
+                        }
+                        const res = await fetch(`${JEV_URL}/v1/systemone`, {
+                          method: 'POST',
+                          signal: AbortSignal.timeout(JEV_TIMEOUT_MS),
+                          headers: { Authorization: `Bearer ${JEV_TOKEN}`, 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            model: JEV_MODEL,
+                            state: { head_code: contents.get(path), note: 'This is the current version of the file at the pull request head.' },
+                            questions,
+                          }),
+                        })
+                        if (res.ok) { body = await res.json(); break }
+                        lastRes = res
+                        if (res.status !== 429 && res.status < 500) break // permanent: do not retry
+                      }
+                      if (!body) throw new Error(`jev HTTP ${lastRes?.status}`)
+                      outcome.jev_input_tokens += body.usage?.input_tokens || 0
+                      for (const c of cs) {
+                        const a = body.answers?.[c.id]
+                        if (!a || typeof a.noul !== 'number') throw new Error(`jev missing answer for ${c.id}`)
+                        const noul = a.noul
+                        const band = noul < JEV_RESOLVE_BELOW ? 'resolve' : noul > JEV_PRESENT_ABOVE ? 'present' : 'uncertain'
+                        screen.set(c.id, { noul, band })
+                      }
+                    } catch (e) {
+                      failures++
+                      console.log(`[verdict-sweeper] jev screen FAIL ${path} (${cs.length} candidates): ${e.message} — they fall through to the reasoning LLM`)
+                    }
+                    await sleep(JEV_PACE_MS)
+                  }
+                })
+              )
+              if (failures > 0) outcome.failures += failures
+              return screen
+            }
 
             try {
               const { candidates, skipped, total, enumerated } = await listCandidates()
@@ -709,6 +848,14 @@ jobs:
               }
 
               const selected = headMoved ? [] : candidates.slice(0, MAX_THREADS)
+              // Stage 1: the calibrated Noul screen (opt-in). Everything it cannot judge
+              // stays absent from the map and goes to stage 2 unchanged.
+              const screen = await jevScreen(selected, tree)
+              if (screen.size > 0) {
+                const bands = { resolve: 0, present: 0, uncertain: 0 }
+                for (const { band } of screen.values()) bands[band]++
+                console.log(`[verdict-sweeper] jev screen bands: resolve=${bands.resolve} present=${bands.present} uncertain=${bands.uncertain}`)
+              }
               for (let i = 0; i < selected.length; i++) {
                 const c = selected[i]
                 if (Date.now() - startedAt > WALL_BUDGET_MS) {
@@ -735,6 +882,35 @@ jobs:
                     outcome.skipped.push(`${c.path}: unclear/cannot_judge`)
                     continue
                   }
+                  const s = screen.get(c.id)
+                  if (s?.band === 'present') {
+                    // Calibrated "still present": keep the thread open without a
+                    // reasoning-LLM call.
+                    console.log(`[verdict-sweeper] skipped ${c.path} (jev noul=${s.noul.toFixed(3)} > ${JEV_PRESENT_ABOVE}): "${short}"`)
+                    outcome.jev_present++
+                    outcome.skipped.push(`${c.path}: still_present/jev`)
+                    continue
+                  }
+                  if (s?.band === 'resolve') {
+                    // Extra mechanical gate before the calibrated resolve: the file must
+                    // actually differ between merge-base and head. A finding on an
+                    // unchanged file cannot have been fixed by a commit in this PR — that
+                    // class ("never applied", partial fixes) escalates to stage 2, which
+                    // still has the evidence gate.
+                    const baseSha = await getMergeBase()
+                    const baseEntry = (await treeAt(baseSha)).entries.get(c.path)
+                    if (baseEntry && baseEntry.sha === hit.sha) {
+                      console.log(`[verdict-sweeper] ${c.path}: jev noul=${s.noul.toFixed(3)} but file unchanged since merge-base; escalating to reasoning LLM: "${short}"`)
+                    } else {
+                      if (DRY_RUN) { console.log(`[verdict-sweeper] ${c.path}: jev noul=${s.noul.toFixed(3)} < ${JEV_RESOLVE_BELOW} + file changed, would resolve "${short}"`); outcome.would_resolve++; continue }
+                      await sleep(DELAY_MS)
+                      const ok = await resolveThread(c.id)
+                      if (ok) { console.log(`[verdict-sweeper] resolved ${c.path} (jev noul=${s.noul.toFixed(3)} < ${JEV_RESOLVE_BELOW}, file changed vs merge-base): "${short}"`); outcome.jev_resolved++ }
+                      else { console.log(`[verdict-sweeper] ${c.path}: thread already resolved elsewhere or no longer resolvable (concurrent run?); not counted as a failure`); outcome.already_resolved++ }
+                      continue
+                    }
+                  }
+                  if (s?.band === 'uncertain') outcome.jev_uncertain++
                   const content = await fetchBlob(hit.sha)
                   if (content === UNCLEAR) {
                     console.log(`[verdict-sweeper] skipped ${c.path} (file too large): "${short}"`)
@@ -764,7 +940,7 @@ jobs:
                 }
               }
 
-              console.log(`[verdict-sweeper] done candidates=${outcome.candidates} llm_calls=${outcome.llm_calls} ${DRY_RUN ? `would_resolve=${outcome.would_resolve}` : `resolved=${outcome.resolved}`} already_resolved=${outcome.already_resolved} deferred=${outcome.deferred} unclear_or_present=${outcome.skipped.length} failures=${outcome.failures}${DRY_RUN ? ' (dry-run, nothing mutated)' : ''}`)
+              console.log(`[verdict-sweeper] done candidates=${outcome.candidates} ${DRY_RUN ? `would_resolve=${outcome.would_resolve}` : `resolved=${outcome.resolved} (jev=${outcome.jev_resolved}, glm=${outcome.llm_calls ? outcome.resolved - outcome.jev_resolved : 0})`} llm_calls=${outcome.llm_calls} jev_screened=${screen.size} jev_present=${outcome.jev_present} jev_uncertain=${outcome.jev_uncertain} jev_tokens=${outcome.jev_input_tokens} already_resolved=${outcome.already_resolved} deferred=${outcome.deferred} unclear_or_present=${outcome.skipped.length} failures=${outcome.failures}${DRY_RUN ? ' (dry-run, nothing mutated)' : ''}`)
             } catch (e) {
               console.error(`[verdict-sweeper] fatal: ${e.message}`)
               process.exit(1)
