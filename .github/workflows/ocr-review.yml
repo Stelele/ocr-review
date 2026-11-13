@@ -101,12 +101,14 @@ jobs:
         # unresolved OCR-owned thread, whether the finding still holds against the
         # CURRENT head version of the file, and resolves it on a confident "fixed"
         # whose evidence quote is verified verbatim against that file AND shown to
-        # be new code (absent from the base version).
+        # be new code (absent at the true merge-base, not just the base tip).
         # Fail-closed: human-replied threads (including replies beyond the first
         # 100 comments or a hasNextPage), non-OCR threads, low confidence,
         # unclear verdicts, evidence mismatches, a moved PR head, and any error
         # are all skipped. One cheap LLM call per lingering thread, paced by
         # VERDICT_DELAY_MS, bounded by VERDICT_WALL_BUDGET_MIN.
+        # Set the repo variable VERDICT_DRY_RUN=true to validate against live
+        # PRs without mutating anything.
         #
         # FORK GUARD: skipped for PRs from forks — a fork's file content is
         # attacker-controlled input to the verdict LLM (prompt-injection
@@ -174,7 +176,7 @@ jobs:
             }
 
             const args = process.argv.slice(2)
-            const DRY_RUN = args.includes('--dry-run')
+            const DRY_RUN = args.includes('--dry-run') || process.env.VERDICT_DRY_RUN === 'true'
 
             const REPO = process.env.OCR_REPOSITORY || ''
             const PR_NUMBER = Number(process.env.OCR_PR_NUMBER || 0)
@@ -279,9 +281,20 @@ jobs:
                   }
                 }
                 lastRes = res
-                if (res.status !== 429 && res.status < 500) break // permanent: do not retry
+                // Retry transient failures: rate limits (429, and the 403 secondary rate
+                // limit which GitHub signals via Retry-After) and server errors.
+                const retryAfter = res.headers?.get?.('retry-after')
+                const rateLimited = res.status === 429 || (res.status === 403 && retryAfter)
+                if (!rateLimited && res.status < 500) break // permanent: do not retry
               }
-              if (lastRes) throw new Error(`${init?.method || 'GET'} ${url}: HTTP ${lastRes.status}${lastErr ? ` (${lastErr.message})` : ''}`)
+              if (lastRes) {
+                if (lastRes.ok) {
+                  // All attempts returned 200 with a body we could not parse: a proxy or
+                  // LB in the path. Distinct from a genuine HTTP error so triage is easy.
+                  throw new Error(`${init?.method || 'GET'} ${url}: non-JSON 200 body on every attempt (proxy/LB?), last error: ${lastErr ? lastErr.message : 'unknown'}`)
+                }
+                throw new Error(`${init?.method || 'GET'} ${url}: HTTP ${lastRes.status}${lastErr ? ` (${lastErr.message})` : ''}`)
+              }
               throw new Error(`${init?.method || 'GET'} ${url}: ${lastErr ? lastErr.message : 'failed'}`)
             }
 
@@ -301,6 +314,24 @@ jobs:
               return githubJson(`https://api.github.com${path}`, {
                 headers: { Accept: accept || 'application/vnd.github+json' },
               })
+            }
+
+            // True merge-base of the PR (base tip is NOT the merge-base; a moved base
+            // branch would make the evidence-is-new-code gate compare against unrelated
+            // content and spuriously reject valid resolutions). Falls back to BASE_SHA.
+            let mergeBaseCache = null
+            async function getMergeBase() {
+              if (!BASE_SHA) return null
+              if (mergeBaseCache === null) {
+                try {
+                  const cmp = await rest(`/repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}`)
+                  mergeBaseCache = cmp.merge_base_commit?.sha || BASE_SHA
+                } catch (e) {
+                  console.log(`[verdict-sweeper] merge-base lookup failed (${e.message}); falling back to base tip`)
+                  mergeBaseCache = BASE_SHA
+                }
+              }
+              return mergeBaseCache
             }
 
             // Ownership marker: OCR tags every inline comment it posts with a per-run HTML
@@ -491,8 +522,7 @@ jobs:
                 'Does the problem described in the finding still exist in the current file content?'
 
               // Single request builder so the retry path cannot drift from the first call.
-              const postLlm = () => fetch(`${LLM_URL}/chat/completions`, {
-                method: 'POST',
+              const postLlm = () => fetch(`${LLM_URL}/chat/completions`, {    method: 'POST',
                 signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
                 headers: {
                   Authorization: `Bearer ${LLM_TOKEN}`,
@@ -509,17 +539,33 @@ jobs:
                 }),
               })
 
-              const res = await postLlm()
-              // Transient = HTTP 429/5xx, OR a 200 with an unparseable body (proxies do
-              // this). One bounded retry; beyond that, fail closed.
-              let res2 = res
+              // Transient = HTTP 429/5xx, a 200 with an unparseable body (proxies do
+              // this), OR a fetch-level failure (network blip, timeout). One bounded
+              // retry; beyond that, fail closed.
+              let res2 = null
+              let fetchErr = null
+              try {
+                res2 = await postLlm()
+              } catch (e) {
+                fetchErr = e
+              }
               for (let attempt = 0; attempt < 2; attempt++) {
                 if (attempt > 0) {
                   // Same backoff policy as githubJson (Retry-After honored) and drain the
                   // previous response so the socket is released before retrying.
                   await sleepAndRetry(2, res2)
-                  try { await res2.arrayBuffer() } catch { /* body already consumed */ }
-                  res2 = await postLlm()
+                  if (res2) { try { await res2.arrayBuffer() } catch { /* body already consumed */ } }
+                  fetchErr = null
+                  try {
+                    res2 = await postLlm()
+                  } catch (e) {
+                    fetchErr = e
+                    res2 = null
+                  }
+                }
+                if (fetchErr) {
+                  if (attempt === 1) throw new Error(`llm call failed (after 1 retry): ${fetchErr.message}`)
+                  continue
                 }
                 let body = null
                 let parseErr = null
@@ -580,10 +626,11 @@ jobs:
                 if (finding.includes(evidence)) throw new Error(`evidence quote is copied from the finding, not the fixed code: "${evidence.slice(0, 60)}"`)
                 if (!content.includes(evidence)) throw new Error(`evidence quote not found in head file: "${evidence.slice(0, 80)}"`)
                 if (BASE_SHA) {
-                  const baseContent = await fileAt(BASE_SHA, path)
+                  const baseSha = await getMergeBase()
+                  const baseContent = await fileAt(baseSha, path)
                   if (baseContent === UNCLEAR) throw new Error('cannot verify evidence is new code (base version unreadable)')
                   if (baseContent !== null && baseContent.includes(evidence)) {
-                    throw new Error('evidence quote already exists in the base version — file unchanged, nothing was fixed here')
+                    throw new Error('evidence quote already exists at the merge-base — file unchanged, nothing was fixed here')
                   }
                 }
               }
@@ -621,7 +668,7 @@ jobs:
               return data.resolveReviewThread.thread.isResolved
             }
 
-            const outcome = { candidates: 0, llm_calls: 0, resolved: 0, would_resolve: 0, deferred: 0, skipped: [], failures: 0 }
+            const outcome = { candidates: 0, llm_calls: 0, resolved: 0, would_resolve: 0, deferred: 0, already_resolved: 0, skipped: [], failures: 0 }
 
             try {
               const { candidates, skipped, total, enumerated } = await listCandidates()
@@ -646,6 +693,7 @@ jobs:
               const headMoved = currentHead !== HEAD_SHA
               if (headMoved) {
                 console.log(`[verdict-sweeper] head moved during the run (${HEAD_SHA.slice(0, 7)}..${currentHead.slice(0, 7)}); skipping all resolutions — the next run re-judges against the new head`)
+                outcome.deferred = candidates.length // everything waits for the next run
               }
 
               const startedAt = Date.now()
@@ -674,7 +722,7 @@ jobs:
                     await sleep(DELAY_MS)
                     const ok = await resolveThread(c.id)
                     if (ok) { console.log(`[verdict-sweeper] resolved ${c.path} (path absent from head tree): "${short}"`); outcome.resolved++ }
-                    else { console.log(`[verdict-sweeper] resolve mutation returned false for ${c.path}`); outcome.failures++ }
+                    else { console.log(`[verdict-sweeper] ${c.path}: thread already resolved elsewhere or no longer resolvable (concurrent run?); not counted as a failure`); outcome.already_resolved++ }
                     continue
                   }
                   if (hit === UNCLEAR) {
@@ -699,7 +747,7 @@ jobs:
                       await sleep(DELAY_MS)
                       const ok = await resolveThread(c.id)
                       if (ok) { console.log(`[verdict-sweeper] resolved ${c.path} (verdict=fixed/high evidence verified): "${short}"`); outcome.resolved++ }
-                      else { console.log(`[verdict-sweeper] resolve mutation returned false for ${c.path}`); outcome.failures++ }
+                      else { console.log(`[verdict-sweeper] ${c.path}: thread already resolved elsewhere or no longer resolvable (concurrent run?); not counted as a failure`); outcome.already_resolved++ }
                     }
                   } else {
                     console.log(`[verdict-sweeper] skipped ${c.path} (verdict=${v.verdict}/${v.confidence}): "${short}"`)
@@ -711,7 +759,7 @@ jobs:
                 }
               }
 
-              console.log(`[verdict-sweeper] done candidates=${outcome.candidates} llm_calls=${outcome.llm_calls} ${DRY_RUN ? `would_resolve=${outcome.would_resolve}` : `resolved=${outcome.resolved}`} deferred=${outcome.deferred} unclear_or_present=${outcome.skipped.length} failures=${outcome.failures}${DRY_RUN ? ' (dry-run, nothing mutated)' : ''}`)
+              console.log(`[verdict-sweeper] done candidates=${outcome.candidates} llm_calls=${outcome.llm_calls} ${DRY_RUN ? `would_resolve=${outcome.would_resolve}` : `resolved=${outcome.resolved}`} already_resolved=${outcome.already_resolved} deferred=${outcome.deferred} unclear_or_present=${outcome.skipped.length} failures=${outcome.failures}${DRY_RUN ? ' (dry-run, nothing mutated)' : ''}`)
             } catch (e) {
               console.error(`[verdict-sweeper] fatal: ${e.message}`)
               process.exit(1)
