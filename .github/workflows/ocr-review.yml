@@ -312,7 +312,18 @@ jobs:
             // OpenCode credential — silently sending it to the hardcoded endpoint would be
             // wrong. Auto-disable unless the token was explicitly given for Jev.
             const JEV_SCREEN_ACTIVE = JEV_SCREEN && !!JEV_TOKEN &&
-              (!!process.env.JEV_TOKEN || /opencode\.ai/.test(LLM_URL))
+              (!!process.env.JEV_TOKEN || isOpencodeHost(LLM_URL))
+
+            // Exact host check, not a substring: a proxy URL that merely CONTAINS
+            // "opencode.ai" must not pass the credential-routing guard.
+            function isOpencodeHost(url) {
+              try {
+                const h = new URL(url).hostname
+                return h === 'opencode.ai' || h.endsWith('.opencode.ai')
+              } catch {
+                return false
+              }
+            }
             if (JEV_SCREEN && !JEV_SCREEN_ACTIVE) {
               console.log('[verdict-sweeper] jev screen disabled for this run (no token, or OCR_LLM_URL points at a non-opencode provider without an explicit JEV_TOKEN) — all candidates go to the reasoning LLM')
             }
@@ -359,9 +370,22 @@ jobs:
                 }
                 lastRes = res
                 // Retry transient failures: rate limits (429, and the 403 secondary rate
-                // limit which GitHub signals via Retry-After) and server errors.
+                // limit — GitHub signals it with a Retry-After header OR a JSON body
+                // mentioning it) and server errors.
                 const retryAfter = res.headers?.get?.('retry-after')
                 const rateLimited = res.status === 429 || (res.status === 403 && retryAfter)
+                if (!rateLimited && res.status === 403) {
+                  // 403 without Retry-After: check the body for the secondary-limit
+                  // message before treating it as a permanent denial.
+                  try {
+                    const bodyText = await res.text()
+                    if (/secondary rate limit/i.test(bodyText)) {
+                      console.log('[verdict-sweeper] GitHub secondary rate limit (403 body, no Retry-After); backing off')
+                      await sleepAndRetry(attempt + 2, res)
+                      continue
+                    }
+                  } catch { /* body unreadable: treat as permanent below */ }
+                }
                 if (!rateLimited && res.status < 500) break // permanent: do not retry
               }
               if (lastRes) {
@@ -576,11 +600,12 @@ jobs:
             }
 
             // The review LLM is a thinking model: its content may wrap the verdict JSON in
-            // reasoning or fences. Candidate order: flat {...} fragments scanned BACK TO
-            // FRONT (the final answer in a thinking-model response comes last), then the
-            // whole text, then fenced blocks — a fence can echo the schema example from
-            // the system prompt during reasoning, so it is tried last. Selection requires
-            // an object carrying a verdict IN RANGE, not merely a verdict key.
+            // reasoning or fences. Candidates are parsed wherever they appear (flat {...}
+            // fragments scanned back to front, whole text, fenced blocks) and SCORED: the
+            // object that satisfies the most of the response contract (verdict in range,
+            // confidence valid, evidence string) wins, with later position breaking ties —
+            // the final answer in a thinking-model response comes last, and neither an
+            // incidental reasoning fragment nor an echoed schema may shadow it.
             function extractVerdictJson(text) {
               const candidates = []
               const flat = text.match(/\{[^{}]*\}/g)
@@ -588,16 +613,25 @@ jobs:
               candidates.push(text.trim())
               const fenced = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)]
               for (const f of fenced) candidates.push(f[1].trim())
-              for (const t of candidates) {
+              const VALID_VERDICTS = ['fixed', 'still_present', 'unclear']
+              let best = null
+              let bestScore = -1
+              for (let pos = 0; pos < candidates.length; pos++) {
+                const t = candidates[pos]
+                let o
                 try {
-                  const o = JSON.parse(t)
-                  if (
-                    o && typeof o === 'object' && !Array.isArray(o) &&
-                    ['fixed', 'still_present', 'unclear'].includes(o.verdict)
-                  ) return o
-                } catch { /* try the next candidate */ }
+                  o = JSON.parse(t)
+                } catch { continue }
+                if (!o || typeof o !== 'object' || Array.isArray(o) || !VALID_VERDICTS.includes(o.verdict)) continue
+                let score = 1
+                if (typeof o.confidence === 'string' && ['high', 'low'].includes(o.confidence.trim().toLowerCase())) score += 1
+                if (typeof o.evidence === 'string' && o.evidence.trim()) score += 1
+                // Later candidates win ties (final answer comes last).
+                const adjusted = score * 10 + pos * 0.001
+                if (adjusted > bestScore) { best = o; bestScore = adjusted }
               }
-              throw new Error(`no parseable verdict JSON in: ${text.slice(0, 160)}`)
+              if (!best) throw new Error(`no parseable verdict JSON in: ${text.slice(0, 160)}`)
+              return best
             }
 
             async function verdict(finding, path, content) {
@@ -691,7 +725,12 @@ jobs:
             // otherwise shadow it (extractVerdictJson therefore walks candidates in a
             // last-match-preferring order — see below).
             async function finishVerdict(body, finding, path, content) {
-              const text = body.choices?.[0]?.message?.content || ''
+              // Some OpenAI-compatible providers return message.content as an array of
+              // parts instead of a string — coerce before treating it as text.
+              const rawContent = body.choices?.[0]?.message?.content
+              const text = Array.isArray(rawContent)
+                ? rawContent.map((p) => (typeof p === 'object' && p !== null ? p.text || '' : String(p || ''))).join('')
+                : String(rawContent || '')
               const parsed = extractVerdictJson(text)
               const v = parsed.verdict
               const conf = typeof parsed.confidence === 'string' ? parsed.confidence.trim().toLowerCase() : ''
@@ -853,9 +892,19 @@ jobs:
                             questions,
                           }),
                         })
-                        if (res.ok) { body = await res.json(); break }
+                        let nonJson = false
+                        if (res.ok) {
+                          try {
+                            body = await res.json()
+                            break
+                          } catch {
+                            // 200 with an unparseable body (proxy/LB) — same transient
+                            // rule as githubJson: retry, not an opaque SyntaxError.
+                            nonJson = true
+                          }
+                        }
                         lastRes = res
-                        if (res.status !== 429 && res.status < 500) break // permanent: do not retry
+                        if (!nonJson && res.status !== 429 && res.status < 500) break // permanent: do not retry
                       }
                       if (!body) throw new Error(`jev HTTP ${lastRes?.status}`)
                       outcome.jev_input_tokens += body.usage?.input_tokens || 0
