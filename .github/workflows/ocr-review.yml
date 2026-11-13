@@ -158,7 +158,11 @@ jobs:
           VERDICT_JEV_RESOLVE_BELOW: ${{ vars.VERDICT_JEV_RESOLVE_BELOW }}
           VERDICT_JEV_PRESENT_ABOVE: ${{ vars.VERDICT_JEV_PRESENT_ABOVE }}
           JEV_MODEL: ${{ vars.JEV_MODEL }}
-          JEV_TOKEN: ${{ secrets.OCR_LLM_TOKEN }}
+          # JEV_TOKEN is deliberately NOT mapped here: the script falls back to
+          # OCR_LLM_TOKEN (the OpenCode key serves both endpoints), and an
+          # explicit JEV_TOKEN is what tells the script "this token was chosen
+          # for Jev on purpose" — which is the only condition under which the
+          # screen runs when OCR_LLM_URL points at a non-opencode provider.
           SWEEPER_SCRIPT: |
             // verdict-sweeper — resolve OCR review threads whose finding no longer exists in the head code.
             //
@@ -308,7 +312,7 @@ jobs:
             // OpenCode credential — silently sending it to the hardcoded endpoint would be
             // wrong. Auto-disable unless the token was explicitly given for Jev.
             const JEV_SCREEN_ACTIVE = JEV_SCREEN && !!JEV_TOKEN &&
-              (!!process.env.JEV_TOKEN || !LLM_URL || /opencode\.ai/.test(LLM_URL))
+              (!!process.env.JEV_TOKEN || /opencode\.ai/.test(LLM_URL))
             if (JEV_SCREEN && !JEV_SCREEN_ACTIVE) {
               console.log('[verdict-sweeper] jev screen disabled for this run (no token, or OCR_LLM_URL points at a non-opencode provider without an explicit JEV_TOKEN) — all candidates go to the reasoning LLM')
             }
@@ -645,7 +649,7 @@ jobs:
                 if (attempt > 0) {
                   // Same backoff policy as githubJson (Retry-After honored) and drain the
                   // previous response so the socket is released before retrying.
-                  await sleepAndRetry(2, res2)
+                  await sleepAndRetry(attempt + 1, res2)
                   if (res2) { try { await res2.arrayBuffer() } catch { /* body already consumed */ } }
                   fetchErr = null
                   try {
@@ -872,6 +876,13 @@ jobs:
                   }
                 })
               )
+              // Severity format drift: if most candidates have no parseable badge, an
+              // upstream comment-format change is silently converting every thread into a
+              // paid stage-2 call — say so loudly instead of failing quietly.
+              const unknownSeverity = selected.filter((c) => c.severity === 'unknown').length
+              if (selected.length > 0 && unknownSeverity > selected.length / 2) {
+                console.log(`[verdict-sweeper] warning: ${unknownSeverity}/${selected.length} candidates have no parseable severity badge — the OCR comment format may have drifted; all of these escalate to the reasoning LLM`)
+              }
               if (failures > 0) outcome.failures += failures
               return screen
             }
@@ -902,11 +913,14 @@ jobs:
               }
 
               const startedAt = Date.now()
-              // Everything not processed this run is deferred; when the head moved that is
-              // ALL candidates (they are re-judged against the new head next run).
+              // Deferred accounting happens at the end of the loop: a candidate counts as
+              // deferred only if nothing handled it this run (cap, budget, head move) —
+              // not the whole candidate list up front.
               outcome.deferred = headMoved ? candidates.length : Math.max(0, candidates.length - MAX_THREADS)
-              if (outcome.deferred > 0) {
-                console.log(`[verdict-sweeper] deferring ${outcome.deferred} candidates${headMoved ? ' (head moved)' : ` beyond VERDICT_MAX_THREADS=${MAX_THREADS}`} — they stay open for a later run`)
+              if (headMoved) {
+                console.log(`[verdict-sweeper] deferring ${outcome.deferred} candidates (head moved) — they stay open for the next run`)
+              } else if (outcome.deferred > 0) {
+                console.log(`[verdict-sweeper] deferring ${outcome.deferred} candidates beyond VERDICT_MAX_THREADS=${MAX_THREADS} — they stay open for a later run`)
               }
 
               const selected = headMoved ? [] : candidates.slice(0, MAX_THREADS)
@@ -939,7 +953,12 @@ jobs:
                   if (hit === null) {
                     // Verified deletion: the complete head tree has no such path, so the
                     // finding cannot apply to the file it was written against.
-                    if (DRY_RUN) { console.log(`[verdict-sweeper] ${c.path}: path absent from complete head tree, would resolve "${short}"`); outcome.would_resolve++; continue }        await sleep(DELAY_MS)
+                    if (DRY_RUN) {
+                      console.log(`[verdict-sweeper] ${c.path}: path absent from complete head tree, would resolve "${short}"`)
+                      outcome.would_resolve++
+                      continue
+                    }
+                    await sleep(DELAY_MS)
                     const ok = await resolveThread(c.id)
                     if (ok) { console.log(`[verdict-sweeper] resolved ${c.path} (path absent from head tree): "${short}"`); outcome.resolved++ }
                     else { console.log(`[verdict-sweeper] ${c.path}: thread already resolved elsewhere or no longer resolvable (concurrent run?); not counted as a failure`); outcome.already_resolved++ }
@@ -985,7 +1004,11 @@ jobs:
                       console.log(`[verdict-sweeper] ${c.path}: base tree truncated, path presence unknown; escalating to reasoning LLM: "${short}"`)
                       outcome.jev_escalated++
                     } else {
-                      if (DRY_RUN) { console.log(`[verdict-sweeper] ${c.path}: jev noul=${s.noul.toFixed(3)} < ${JEV_RESOLVE_BELOW} + file changed, would resolve "${short}"`); outcome.would_resolve++; continue }
+                      if (DRY_RUN) {
+                        console.log(`[verdict-sweeper] ${c.path}: jev noul=${s.noul.toFixed(3)} < ${JEV_RESOLVE_BELOW} + file changed, would resolve "${short}"`)
+                        outcome.would_resolve++
+                        continue
+                      }
                       await sleep(DELAY_MS)
                       const ok = await resolveThread(c.id)
                       if (ok) { console.log(`[verdict-sweeper] resolved ${c.path} (jev noul=${s.noul.toFixed(3)} < ${JEV_RESOLVE_BELOW}, file changed vs merge-base): "${short}"`); outcome.jev_resolved++ }
@@ -1005,7 +1028,11 @@ jobs:
                   outcome.llm_calls++
                   const v = await verdict(c.finding, c.path, content)
                   if (v.verdict === 'fixed' && v.confidence === 'high') {
-                    if (DRY_RUN) { console.log(`[verdict-sweeper] ${c.path}: verdict=fixed/high evidence="${v.evidence.slice(0, 60)}", would resolve "${short}"`); outcome.would_resolve++; continue }
+                    if (DRY_RUN) {
+                      console.log(`[verdict-sweeper] ${c.path}: verdict=fixed/high evidence="${v.evidence.slice(0, 60)}", would resolve "${short}"`)
+                      outcome.would_resolve++
+                      continue
+                    }
                     await sleep(DELAY_MS)
                     const ok = await resolveThread(c.id)
                     if (ok) { console.log(`[verdict-sweeper] resolved ${c.path} (verdict=fixed/high evidence verified): "${short}"`); outcome.resolved++ }
