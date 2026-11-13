@@ -104,8 +104,9 @@ jobs:
         # be new code (absent from the base version).
         # Fail-closed: human-replied threads (including replies beyond the first
         # 100 comments or a hasNextPage), non-OCR threads, low confidence,
-        # unclear verdicts, evidence mismatches and any error are all skipped.
-        # One cheap LLM call per lingering thread, paced by VERDICT_DELAY_MS.
+        # unclear verdicts, evidence mismatches, a moved PR head, and any error
+        # are all skipped. One cheap LLM call per lingering thread, paced by
+        # VERDICT_DELAY_MS, bounded by VERDICT_WALL_BUDGET_MIN.
         #
         # FORK GUARD: skipped for PRs from forks — a fork's file content is
         # attacker-controlled input to the verdict LLM (prompt-injection
@@ -184,6 +185,7 @@ jobs:
             const LLM_MODEL = process.env.OCR_LLM_MODEL || ''
             const MAX_THREADS_RAW = Number(process.env.VERDICT_MAX_THREADS || 25)
             const DELAY_MS_RAW = Number(process.env.VERDICT_DELAY_MS || 800)
+            const WALL_BUDGET_MIN_RAW = Number(process.env.VERDICT_WALL_BUDGET_MIN || 25)
             const MAX_FILE_CHARS = 60000
             const GH_TIMEOUT_MS = 30000   // GitHub API calls
             const LLM_TIMEOUT_MS = 120000 // thinking-model verdicts legitimately run long
@@ -218,51 +220,77 @@ jobs:
             // the cap (candidates.slice(0, NaN) === []) or the pacing (sleep(NaN) = no-op).
             const MAX_THREADS = Number.isFinite(MAX_THREADS_RAW) && MAX_THREADS_RAW > 0 ? MAX_THREADS_RAW : 25
             const DELAY_MS = Number.isFinite(DELAY_MS_RAW) && DELAY_MS_RAW >= 0 ? DELAY_MS_RAW : 800
+            // Wall-clock budget for the whole sweep: with worst-case per-candidate cost
+            // (two 120s LLM timeouts + REST retries + pacing) 25 candidates can far exceed
+            // any sensible job ceiling. When the budget runs out, remaining candidates are
+            // deferred to the next run (they are re-judged from scratch then) instead of
+            // being silently truncated by the job timeout.
+            const WALL_BUDGET_MS = Number.isFinite(WALL_BUDGET_MIN_RAW) && WALL_BUDGET_MIN_RAW > 0
+              ? WALL_BUDGET_MIN_RAW * 60000
+              : 25 * 60000
             if (MAX_THREADS_RAW !== MAX_THREADS) {
               console.log(`[verdict-sweeper] VERDICT_MAX_THREADS="${process.env.VERDICT_MAX_THREADS}" is not a positive number; using default ${MAX_THREADS}`)
             }
             if (DELAY_MS_RAW !== DELAY_MS) {
               console.log(`[verdict-sweeper] VERDICT_DELAY_MS="${process.env.VERDICT_DELAY_MS}" is not a non-negative number; using default ${DELAY_MS}`)
             }
-
-            async function gql(query, variables = {}) {
-              const res = await fetch('https://api.github.com/graphql', {
-                method: 'POST',
-                signal: AbortSignal.timeout(GH_TIMEOUT_MS),
-                headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query, variables }),
-              })
-              const body = await res.json()
-              if (body.errors || !body.data) {
-                throw new Error(`graphql: ${JSON.stringify(body.errors || body)}`)
-              }
-              return body.data
+            if (WALL_BUDGET_MIN_RAW !== WALL_BUDGET_MS / 60000) {
+              console.log(`[verdict-sweeper] VERDICT_WALL_BUDGET_MIN="${process.env.VERDICT_WALL_BUDGET_MIN}" is not a positive number; using default ${WALL_BUDGET_MS / 60000}`)
             }
 
-            async function sleepAndRetry(attempt, res) {
-              // Honor Retry-After when GitHub sends it on 429; otherwise exponential-ish backoff.
-              let ms = attempt * 1000
-              if (res) {
-                const ra = res.headers?.get?.('retry-after')
-                if (ra && Number.isFinite(Number(ra))) ms = Math.max(ms, Number(ra) * 1000)
+            // Shared GitHub fetch with bounded retries: honors Retry-After on 429, retries
+            // 5xx, network blips and non-JSON 200 bodies (proxies), 2 retries max. GraphQL
+            // errors are semantic, not transient — they throw on first sight.
+            async function githubJson(url, init) {
+              let lastRes = null
+              let lastErr = null
+              for (let attempt = 0; attempt < 3; attempt++) {
+                if (attempt > 0) await sleepAndRetry(attempt, lastRes)
+                lastRes = null
+                lastErr = null
+                let res
+                try {
+                  res = await fetch(url, {
+                    ...init,
+                    signal: AbortSignal.timeout(GH_TIMEOUT_MS),
+                    headers: { Authorization: `Bearer ${TOKEN}`, ...(init?.headers || {}) },
+                  })
+                } catch (e) {
+                  lastErr = e // network blip / timeout — transient
+                  continue
+                }
+                if (res.ok) {
+                  try {
+                    return await res.json()
+                  } catch (e) {
+                    lastErr = e // non-JSON 200 body (proxy) — treat as transient
+                    lastRes = res
+                    continue
+                  }
+                }
+                lastRes = res
+                if (res.status !== 429 && res.status < 500) break // permanent: do not retry
               }
-              await sleep(ms + Math.floor(Math.random() * 250))
+              if (lastRes) throw new Error(`${init?.method || 'GET'} ${url}: HTTP ${lastRes.status}${lastErr ? ` (${lastErr.message})` : ''}`)
+              throw new Error(`${init?.method || 'GET'} ${url}: ${lastErr ? lastErr.message : 'failed'}`)
+            }
+
+            async function gql(query, variables = {}) {
+              const data = await githubJson('https://api.github.com/graphql', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query, variables }),
+              })
+              if (data.errors || !data.data) {
+                throw new Error(`graphql: ${JSON.stringify(data.errors || data)}`)
+              }
+              return data.data
             }
 
             async function rest(path, accept) {
-              let last
-              for (let attempt = 0; attempt < 3; attempt++) {
-                if (attempt > 0) await sleepAndRetry(attempt, last)
-                const res = await fetch(`https://api.github.com${path}`, {
-                  signal: AbortSignal.timeout(GH_TIMEOUT_MS),
-                  headers: { Authorization: `Bearer ${TOKEN}`, Accept: accept || 'application/vnd.github+json' },
-                })
-                if (res.ok) return res.json()
-                last = res
-                // Retry transient failures only: rate limits and server errors.
-                if (res.status !== 429 && res.status < 500) break
-              }
-              throw new Error(`${path}: HTTP ${last.status}`)
+              return githubJson(`https://api.github.com${path}`, {
+                headers: { Accept: accept || 'application/vnd.github+json' },
+              })
             }
 
             // Ownership marker: OCR tags every inline comment it posts with a per-run HTML
@@ -411,22 +439,25 @@ jobs:
             }
 
             // The review LLM is a thinking model: its content may wrap the verdict JSON in
-            // reasoning or fences. Try, in order: fenced code blocks, the whole text, then
-            // every flat {...} fragment. Flat fragments are scanned BACK TO FRONT and the
-            // last object that parses AND carries a verdict field wins — the final answer
-            // in a thinking-model response comes last, and incidental reasoning snippets
-            // must not shadow it. Nothing parses: hard error (fail-closed).
+            // reasoning or fences. Candidate order: flat {...} fragments scanned BACK TO
+            // FRONT (the final answer in a thinking-model response comes last), then the
+            // whole text, then fenced blocks — a fence can echo the schema example from
+            // the system prompt during reasoning, so it is tried last. Selection requires
+            // an object carrying a verdict IN RANGE, not merely a verdict key.
             function extractVerdictJson(text) {
               const candidates = []
-              const fenced = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)]
-              for (const f of fenced) candidates.push(f[1].trim())
-              candidates.push(text.trim())
               const flat = text.match(/\{[^{}]*\}/g)
               if (flat) candidates.push(...flat.reverse())
+              candidates.push(text.trim())
+              const fenced = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)]
+              for (const f of fenced) candidates.push(f[1].trim())
               for (const t of candidates) {
                 try {
                   const o = JSON.parse(t)
-                  if (o && typeof o === 'object' && !Array.isArray(o) && 'verdict' in o) return o
+                  if (
+                    o && typeof o === 'object' && !Array.isArray(o) &&
+                    ['fixed', 'still_present', 'unclear'].includes(o.verdict)
+                  ) return o
                 } catch { /* try the next candidate */ }
               }
               throw new Error(`no parseable verdict JSON in: ${text.slice(0, 160)}`)
@@ -469,15 +500,33 @@ jobs:
               })
 
               const res = await postLlm()
-              if (!res.ok && (res.status === 429 || res.status >= 500)) {
-                // One bounded retry for transient LLM failures; beyond that, fail closed.
-                await sleepAndRetry(2, res)
-                const retry = await postLlm()
-                if (!retry.ok) throw new Error(`llm HTTP ${retry.status} (after 1 retry)`)
-                return finishVerdict(await retry.json(), finding, path, content)
+              // Transient = HTTP 429/5xx, OR a 200 with an unparseable body (proxies do
+              // this). One bounded retry; beyond that, fail closed.
+              let res2 = res
+              for (let attempt = 0; attempt < 2; attempt++) {
+                if (attempt > 0) {
+                  await sleepAndRetry(2, res2)
+                  res2 = await postLlm()
+                }
+                let body = null
+                let parseErr = null
+                if (res2.ok) {
+                  try {
+                    body = await res2.json()
+                  } catch (e) {
+                    parseErr = e
+                  }
+                }
+                const transient = res2.ok ? parseErr !== null : (res2.status === 429 || res2.status >= 500)
+                if (!transient) {
+                  if (!res2.ok) throw new Error(`llm HTTP ${res2.status}`)
+                  return finishVerdict(body, finding, path, content)
+                }
+                if (attempt === 1) {
+                  throw new Error(parseErr ? `llm returned a non-JSON body (after 1 retry)` : `llm HTTP ${res2.status} (after 1 retry)`)
+                }
               }
-              if (!res.ok) throw new Error(`llm HTTP ${res.status}`)
-              return finishVerdict(await res.json(), finding, path, content)
+              throw new Error('llm call failed (unreachable)') // defensive; loop always returns/throws
             }
 
             // Validate and gate the LLM's verdict object. Prefer the LAST parseable
@@ -564,13 +613,42 @@ jobs:
               console.log(`[verdict-sweeper] threads=${total} enumerated=${enumerated} resolved_before=${skipped.resolved} not_ocr=${skipped.not_ocr} human_replied=${skipped.human_replied} candidates=${candidates.length}`)
               outcome.candidates = candidates.length
               const tree = await treeAt(HEAD_SHA)
+
+              // Head-moved guard: the review (and this sweep's evidence) is a snapshot at
+              // OCR_HEAD_SHA. If the PR head has moved since, a resolution would act on a
+              // stale verdict — skip everything; the next run reviews and sweeps fresh.
+              // Mid-sweep commits remain an accepted residual: the next push triggers a
+              // full re-review + re-sweep (same race class as the action's resolve_outdated).
+              const prNow = await gql(
+                `query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) { headRefOid }
+                  }
+                }`,
+                { owner: REPO.split('/')[0], name: REPO.split('/')[1], number: PR_NUMBER }
+              )
+              const currentHead = prNow.repository.pullRequest.headRefOid
+              const headMoved = currentHead !== HEAD_SHA
+              if (headMoved) {
+                console.log(`[verdict-sweeper] head moved during the run (${HEAD_SHA.slice(0, 7)}..${currentHead.slice(0, 7)}); skipping all resolutions — the next run re-judges against the new head`)
+              }
+
+              const startedAt = Date.now()
               const deferred = Math.max(0, candidates.length - MAX_THREADS)
               if (deferred > 0) {
                 outcome.deferred = deferred
                 console.log(`[verdict-sweeper] deferring ${deferred} candidates beyond VERDICT_MAX_THREADS=${MAX_THREADS} — they stay open for a later run`)
               }
 
-              for (const c of candidates.slice(0, MAX_THREADS)) {
+              const selected = headMoved ? [] : candidates.slice(0, MAX_THREADS)
+              for (let i = 0; i < selected.length; i++) {
+                const c = selected[i]
+                if (Date.now() - startedAt > WALL_BUDGET_MS) {
+                  const notProcessed = selected.length - i
+                  outcome.deferred += notProcessed
+                  console.log(`[verdict-sweeper] wall-clock budget (${WALL_BUDGET_MS / 60000} min) reached; deferring ${notProcessed} remaining candidates to the next run`)
+                  break
+                }
                 const short = c.finding.replace(/\s+/g, ' ').slice(0, 90)
                 try {
                   const hit = headFile(tree, c.path)
