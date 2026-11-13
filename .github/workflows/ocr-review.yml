@@ -104,11 +104,12 @@ jobs:
         #   against the current head file in ONE batched request per file.
         #   Measured on 608 real threads: zero false resolves below noul 0.2.
         #   noul < VERDICT_JEV_RESOLVE_BELOW, severity <= medium (critical and
-        #   high ALWAYS escalate to stage 2 and its evidence gate), and the
-        #   file changed vs merge-base -> resolve without a reasoning-LLM call;
-        #   noul > VERDICT_JEV_PRESENT_ABOVE -> keep open without one. On a
-        #   594-thread backlog replay this decided 70% of threads in 0.8
-        #   minutes at zero cost.
+        #   high ALWAYS escalate to stage 2 and its evidence gate; the badge is
+        #   read from the top line of the comment so a quoted badge cannot
+        #   downgrade it), and the file changed vs merge-base -> resolve without
+        #   a reasoning-LLM call; noul > VERDICT_JEV_PRESENT_ABOVE -> keep open
+        #   without one. On a 594-thread backlog replay this decided 70% of
+        #   threads in 0.8 minutes at zero cost.
         #
         #   Stage 2 (always available, unchanged): the reasoning LLM judges the
         #   uncertain band and everything the screen could not read, with the
@@ -116,10 +117,14 @@ jobs:
         #
         # Fail-closed: human-replied threads (including replies beyond the first
         # 100 comments or a hasNextPage), non-OCR threads, low confidence,
-        # unclear verdicts, evidence mismatches, a moved PR head, any Jev or LLM
-        # error (screen failures fall through to stage 2), and any error are all
-        # skipped. Fork PRs are skipped entirely — a fork's file content is
-        # attacker-controlled input to both judge models.
+        # unclear verdicts, evidence mismatches, a moved PR head, a truncated
+        # base tree, any Jev or LLM error (screen failures and per-candidate
+        # anomalies fall through to stage 2), and any error are all skipped.
+        # Fork PRs are skipped entirely — a fork's file content is
+        # attacker-controlled input to both judge models. The screen also
+        # auto-disables when OCR_LLM_URL points at a non-opencode provider
+        # without an explicit JEV_TOKEN (the shared credential must not
+        # silently authenticate against the hardcoded second endpoint).
         if: github.event.pull_request.head.repo.full_name == github.repository
         #
         # The script is INLINED below rather than fetched from this repo: the
@@ -297,6 +302,15 @@ jobs:
             }
             if (JEV_SCREEN && !JEV_TOKEN) {
               console.log('[verdict-sweeper] VERDICT_JEV_SCREEN=true but no JEV_TOKEN/OCR_LLM_TOKEN — screen disabled for this run, all candidates go to the reasoning LLM')
+            }
+            // The screen shares OCR_LLM_TOKEN with the hardcoded System One endpoint. If
+            // the stage-2 LLM is provisioned for a DIFFERENT provider, that key is not an
+            // OpenCode credential — silently sending it to the hardcoded endpoint would be
+            // wrong. Auto-disable unless the token was explicitly given for Jev.
+            const JEV_SCREEN_ACTIVE = JEV_SCREEN && !!JEV_TOKEN &&
+              (!!process.env.JEV_TOKEN || !LLM_URL || /opencode\.ai/.test(LLM_URL))
+            if (JEV_SCREEN && !JEV_SCREEN_ACTIVE) {
+              console.log('[verdict-sweeper] jev screen disabled for this run (no token, or OCR_LLM_URL points at a non-opencode provider without an explicit JEV_TOKEN) — all candidates go to the reasoning LLM')
             }
 
             // Backoff between retry attempts; honors Retry-After when GitHub sends it on 429.
@@ -476,12 +490,14 @@ jobs:
               return result
             }
 
-            // Severity badge: every OCR inline comment carries a shields.io badge like
+            // Severity badge: every OCR inline comment starts with a shields.io badge like
             // ![security · critical](https://img.shields.io/badge/security-critical-darkred).
-            // Read mechanically from the raw body BEFORE the badges are stripped — it
-            // decides which findings the Jev screen may auto-resolve.
+            // Read mechanically from the raw body BEFORE the badges are stripped, anchored
+            // to a line start: a badge URL quoted deeper in the prose must not downgrade a
+            // critical finding past the severity cap. Unmatched -> 'unknown' -> escalates
+            // to the reasoning LLM (fail-closed).
             function severityOf(rawBody) {
-              const m = rawBody.match(/img\.shields\.io\/badge\/[^)\s]*[-–](critical|high|medium|low)-[a-z]+\)/i)
+              const m = rawBody.match(/^\s*!\[[^\]]*\]\(https:\/\/img\.shields\.io\/badge\/[^)\s]*[-–](critical|high|medium|low)-[a-z]+\)/im)
               return m ? m[1].toLowerCase() : 'unknown'
             }
 
@@ -759,7 +775,7 @@ jobs:
             // the per-candidate budget check defers them).
             async function jevScreen(selected, tree, startedAt) {
               const screen = new Map()
-              if (!JEV_SCREEN || !JEV_TOKEN) return screen
+              if (!JEV_SCREEN_ACTIVE) return screen
 
               // Group candidates by path: one System One request per file, all its
               // unresolved threads as parallel Noul questions (the batching that makes the
@@ -832,13 +848,22 @@ jobs:
                       }
                       if (!body) throw new Error(`jev HTTP ${lastRes?.status}`)
                       outcome.jev_input_tokens += body.usage?.input_tokens || 0
+                      let bad = 0
                       for (const c of cs) {
-                        const a = body.answers?.[c.id]
-                        if (!a || typeof a.noul !== 'number') throw new Error(`jev missing answer for ${c.id}`)
-                        const noul = a.noul
-                        const band = noul < JEV_RESOLVE_BELOW ? 'resolve' : noul > JEV_PRESENT_ABOVE ? 'present' : 'uncertain'
-                        screen.set(c.id, { noul, band })
+                        // Per-candidate isolation: one malformed/missing answer must not
+                        // poison the whole file batch — that candidate just falls through
+                        // to stage 2; the rest of the batch still screens.
+                        try {
+                          const a = body.answers?.[c.id]
+                          if (!a || typeof a.noul !== 'number') throw new Error('missing/invalid answer')
+                          const band = a.noul < JEV_RESOLVE_BELOW ? 'resolve' : a.noul > JEV_PRESENT_ABOVE ? 'present' : 'uncertain'
+                          screen.set(c.id, { noul: a.noul, band })
+                        } catch (e) {
+                          bad++
+                          console.log(`[verdict-sweeper] jev screen: candidate falls through to reasoning LLM (${e.message}): ${c.id.slice(0, 60)}`)
+                        }
                       }
+                      if (bad > 0) console.log(`[verdict-sweeper] jev screen ${path}: ${bad}/${cs.length} candidates fell through`)
                     } catch (e) {
                       failures++
                       console.log(`[verdict-sweeper] jev screen FAIL ${path} (${cs.length} candidates): ${e.message} — they fall through to the reasoning LLM`)
@@ -947,11 +972,17 @@ jobs:
                     // actually differ between merge-base and head. A finding on an
                     // unchanged file cannot have been fixed by a commit in this PR — that
                     // class ("never applied", partial fixes) escalates to stage 2, which
-                    // still has the evidence gate.
+                    // still has the evidence gate. Fail-closed on an unreadable base: a
+                    // path MISSING from a TRUNCATED base tree is unknown, not unchanged —
+                    // only a complete tree can prove the path was absent at the base.
                     const baseSha = await getMergeBase()
-                    const baseEntry = (await treeAt(baseSha)).entries.get(c.path)
+                    const baseTree = await treeAt(baseSha)
+                    const baseEntry = baseTree.entries.get(c.path)
                     if (baseEntry && baseEntry.sha === hit.sha) {
                       console.log(`[verdict-sweeper] ${c.path}: jev noul=${s.noul.toFixed(3)} but file unchanged since merge-base; escalating to reasoning LLM: "${short}"`)
+                      outcome.jev_escalated++
+                    } else if (!baseTree.complete && !baseEntry) {
+                      console.log(`[verdict-sweeper] ${c.path}: base tree truncated, path presence unknown; escalating to reasoning LLM: "${short}"`)
                       outcome.jev_escalated++
                     } else {
                       if (DRY_RUN) { console.log(`[verdict-sweeper] ${c.path}: jev noul=${s.noul.toFixed(3)} < ${JEV_RESOLVE_BELOW} + file changed, would resolve "${short}"`); outcome.would_resolve++; continue }
