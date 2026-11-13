@@ -7,12 +7,15 @@ on pull requests, with the account-wide tuned configuration:
 - `incremental` — never re-posts a finding whose (path, line) already has a bot comment
 - `checkpoint_range` — the next push reviews only what changed since the last reviewed head
 - `resolve_outdated` — auto-resolves the bot's own stale threads (caller must grant `contents: write`)
-- `verdict sweeper` (`scripts/verdict-sweeper.mjs`) — after the review, each unresolved
-  OCR-owned thread is judged against the **current head version of the file**; threads
-  whose finding no longer holds are resolved on a confident "fixed". Catches in-place
-  fixes, which never become `outdated` and so are invisible to `resolve_outdated`.
-  Fail-closed: human-replied threads, non-OCR threads, low-confidence and unclear
-  verdicts are all left alone. One cheap LLM call per lingering thread.
+- `verdict sweeper` (inlined in the workflow as `SWEEPER_SCRIPT`) — after the review, each
+  unresolved OCR-owned thread is judged against the **current head version of the file**
+  (fetched via the git trees API, so existence is verified and paths never hit
+  URL-encoding edge cases); threads whose finding no longer holds are resolved on a
+  confident "fixed". Catches in-place fixes, which never become `outdated` and so are
+  invisible to `resolve_outdated`. Fail-closed: human-replied threads, non-OCR threads,
+  low-confidence and unclear verdicts are all left alone. One cheap LLM call per lingering
+  thread. The step is `continue-on-error` — a sweeper failure never marks a completed
+  review red.
 - `route_severity_below: low` + `route_categories: style,documentation,other` — noise goes to the sticky summary; inline comments stay actionable
 
 ## One config, everywhere
