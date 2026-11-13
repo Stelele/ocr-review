@@ -11,11 +11,12 @@ on pull requests, with the account-wide tuned configuration:
   unresolved OCR-owned thread is judged against the **current head version of the file**
   (fetched via the git trees API, so existence is verified and paths never hit
   URL-encoding edge cases); threads whose finding no longer holds are resolved on a
-  confident "fixed". Catches in-place fixes, which never become `outdated` and so are
-  invisible to `resolve_outdated`. Fail-closed: human-replied threads, non-OCR threads,
-  low-confidence and unclear verdicts are all left alone. One cheap LLM call per lingering
-  thread. The step is `continue-on-error` — a sweeper failure never marks a completed
-  review red.
+  confident "fixed" whose **evidence quote is verified verbatim against the head file**.
+  Catches in-place fixes, which never become `outdated` and so are invisible to
+  `resolve_outdated`. Fail-closed: human-replied threads, non-OCR threads, low-confidence
+  and unclear verdicts are all left alone. One cheap LLM call per lingering thread. The
+  step is `continue-on-error` and **skipped for fork PRs** (fork file content is
+  attacker-controlled input to the verdict LLM).
 - `route_severity_below: low` + `route_categories: style,documentation,other` — noise goes to the sticky summary; inline comments stay actionable
 
 ## One config, everywhere
