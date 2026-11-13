@@ -29,7 +29,10 @@ jobs:
   review:
     name: ai code review
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 30 min covered the review alone; the verdict sweeper adds a worst case of
+    # VERDICT_MAX_THREADS x (LLM timeout + retry + pacing), so the ceiling is
+    # raised. It is a ceiling, not a target — typical runs stay under 10.
+    timeout-minutes: 45
     steps:
       - name: Verify required secrets
         env:
@@ -446,7 +449,8 @@ jobs:
                 `Current version of \`${path}\` at the PR head:\n"""\n${content}\n"""\n\n` +
                 'Does the problem described in the finding still exist in the current file content?'
 
-              const res = await fetch(`${LLM_URL}/chat/completions`, {
+              // Single request builder so the retry path cannot drift from the first call.
+              const postLlm = () => fetch(`${LLM_URL}/chat/completions`, {
                 method: 'POST',
                 signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
                 headers: {
@@ -463,28 +467,14 @@ jobs:
                   ],
                 }),
               })
+
+              const res = await postLlm()
               if (!res.ok && (res.status === 429 || res.status >= 500)) {
                 // One bounded retry for transient LLM failures; beyond that, fail closed.
                 await sleepAndRetry(2, res)
-                const retry = await fetch(`${LLM_URL}/chat/completions`, {
-                  method: 'POST',
-                  signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
-                  headers: {
-                    Authorization: `Bearer ${LLM_TOKEN}`,
-                    'Content-Type': 'application/json',
-                    'x-opencode-session': 'verdict-sweeper',
-                  },
-                  body: JSON.stringify({
-                    model: LLM_MODEL,
-                    temperature: 0,
-                    messages: [
-                      { role: 'system', content: system },
-                      { role: 'user', content: user },
-                    ],
-                  }),
-                })
+                const retry = await postLlm()
                 if (!retry.ok) throw new Error(`llm HTTP ${retry.status} (after 1 retry)`)
-                return finishVerdict(await retry.json())
+                return finishVerdict(await retry.json(), finding, path, content)
               }
               if (!res.ok) throw new Error(`llm HTTP ${res.status}`)
               return finishVerdict(await res.json(), finding, path, content)
