@@ -13,6 +13,12 @@ name: ocr-review
 
 on:
   workflow_call:
+    inputs:
+      runner:
+        description: "Label of the runner the review job needs. Private repos with a self-hosted runner pass `self-hosted` (free minutes); public repos keep the default and burn GitHub-hosted minutes."
+        required: false
+        type: string
+        default: "ubuntu-latest"
 
 concurrency:
   group: ocr-review-${{ github.ref }}
@@ -28,7 +34,7 @@ permissions:
 jobs:
   review:
     name: ai code review
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     # The review step can use up to ~30 min (the old ceiling) and the verdict
     # sweeper adds its own wall budget (default 25), so the ceiling covers the
     # sum. It is a ceiling, not a target — typical runs stay under 10.
