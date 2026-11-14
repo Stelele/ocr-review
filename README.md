@@ -17,7 +17,8 @@ on pull requests, with the account-wide tuned configuration:
   and unclear verdicts are all left alone. One cheap LLM call per lingering thread. The
   step is `continue-on-error` and **skipped for fork PRs** (fork file content is
   attacker-controlled input to the verdict LLM).
-- `two-stage gate` (per-repo opt-in: set the `VERDICT_JEV_SCREEN` variable to `"true"`) —
+- `two-stage gate` (**on by default**; a repo opts out by setting the `VERDICT_JEV_SCREEN`
+  variable to `"false"`) —
   stage 1 screens every unresolved thread with a **calibrated Noul** (`jev-1.13-free` via
   OpenCode's System One endpoint — hardcoded, *not* a variable, so a settings-writable
   value can never repoint a request that carries code and the token — sharing the

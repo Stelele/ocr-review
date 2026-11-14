@@ -99,8 +99,9 @@ jobs:
         # a fix that rewrites the commented lines in place never becomes outdated,
         # so those threads would stay open forever. Two-stage resolution:
         #
-        #   Stage 1 (opt-in per repo: set the VERDICT_JEV_SCREEN variable to
-        #   "true"): a calibrated Noul screen judges every unresolved thread
+        #   Stage 1 (ON by default; a repo opts out by setting the
+        #   VERDICT_JEV_SCREEN variable to "false"): a calibrated Noul screen
+        #   judges every unresolved thread
         #   against the current head file in ONE batched request per file.
         #   Measured on 608 real threads: zero false resolves below noul 0.2.
         #   noul < VERDICT_JEV_RESOLVE_BELOW, severity <= medium (critical and
@@ -147,9 +148,10 @@ jobs:
           OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
           OCR_LLM_TOKEN: ${{ secrets.OCR_LLM_TOKEN }}
           OCR_LLM_MODEL: ${{ secrets.OCR_LLM_MODEL }}
-          # Per-repo knobs (optional, defaults in the script). VERDICT_JEV_SCREEN
-          # = "true" enables the stage-1 Noul screen; VERDICT_DRY_RUN = "true"
-          # validates without resolving.
+          # Per-repo knobs (optional, defaults in the script). The stage-1 Noul
+          # screen is ON by default — set VERDICT_JEV_SCREEN="false" to opt a
+          # repo out (every thread then goes to the reasoning LLM);
+          # VERDICT_DRY_RUN="true" validates without resolving.
           VERDICT_DRY_RUN: ${{ vars.VERDICT_DRY_RUN }}
           VERDICT_MAX_THREADS: ${{ vars.VERDICT_MAX_THREADS }}
           VERDICT_DELAY_MS: ${{ vars.VERDICT_DELAY_MS }}
@@ -227,13 +229,17 @@ jobs:
             const GH_TIMEOUT_MS = 30000   // GitHub API calls
             const LLM_TIMEOUT_MS = 120000 // thinking-model verdicts legitimately run long
 
-            // --- two-stage gate: Jev noul screen (per-repo opt-in) ---
+            // --- two-stage gate: Jev noul screen (default ON, per-repo opt-out) ---
             // Stage 1 is a calibrated yes/no screen (jev via the System One endpoint, which
             // shares the OpenCode key by default). Resolve only when noul < RESOLVE_BELOW
             // (calibration on 608 real threads: zero false resolves below 0.2); keep open
             // when noul > PRESENT_ABOVE; escalate the middle band to the reasoning LLM.
+            // DEFAULT IS ON: the screen decides ~70% of threads for free in seconds, and
+            // without it every lingering thread pays a slow reasoning-LLM call. A repo
+            // opts out by setting the VERDICT_JEV_SCREEN variable to "false" (or 0/no/off).
             // Any Jev failure is fail-closed: those candidates fall through to stage 2.
-            const JEV_SCREEN = process.env.VERDICT_JEV_SCREEN === 'true'
+            const SCREEN_OFF_VALUES = new Set(['false', '0', 'no', 'off'])
+            const JEV_SCREEN = !SCREEN_OFF_VALUES.has((process.env.VERDICT_JEV_SCREEN || '').trim().toLowerCase())
             // Trusted endpoint, hardcoded deliberately: routing it through a repo variable
             // would let anyone with settings access repoint a request that carries head
             // file contents AND the OCR_LLM_TOKEN bearer header at an attacker-controlled
