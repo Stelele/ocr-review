@@ -35,6 +35,20 @@ jobs:
   review:
     name: ai code review
     runs-on: ${{ inputs.runner }}
+    # Every run executes inside a pinned Docker image — the same posture the
+    # estate's deployable work holds. A self-hosted runner otherwise inherits
+    # whatever Node the job's non-interactive shell resolves: on ngift-pc that
+    # was the system Node 22 whose global prefix (/usr/local/lib/node_modules,
+    # root-owned) made the composite action's `npm install -g` fail EACCES
+    # (exit 243), killing every private repo's review. Inside the container
+    # the install lands in the image's own prefix, GitHub-hosted and
+    # self-hosted runners run the same toolchain, and a host Node upgrade can
+    # no longer break reviews silently.
+    # Pinned by digest, not tag — a mutable tag executes whatever gets pushed
+    # next. Self-hosted runners need Docker on the host and the runner user in
+    # the docker group.
+    container:
+      image: node:24-bookworm@sha256:9d266751ca3d7fdbe651c878ffd5ad0a42fed49a18c283509267c97f025b7496
     # The review step can use up to ~30 min (the old ceiling) and the verdict
     # sweeper adds its own wall budget (default 25), so the ceiling covers the
     # sum. It is a ceiling, not a target — typical runs stay under 10.
