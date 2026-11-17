@@ -68,6 +68,15 @@ jobs:
             echo "::error::One or more of OCR_LLM_URL / OCR_LLM_TOKEN / OCR_LLM_MODEL is empty. Provision all three repo secrets (OpenCode Go endpoint, API key, and model id) before enabling review."
             exit 1
           fi
+      - name: Prepare git for root-in-container (dubious ownership)
+        # The container runs as root (no --user: the OCR install needs the
+        # image's own prefix), but on a self-hosted lane the runner process
+        # creates the workspace as the host user (uid 1000, `gift`). Git's
+        # safe.directory hardening (CVE-2022-24765) makes git-as-root refuse
+        # such a directory with "detected dubious ownership" before any
+        # review can run. The wildcard exception is job-scoped: the container
+        # is ephemeral, so it cannot leak beyond this run.
+        run: git config --global --add safe.directory '*'
       - name: Run OpenCodeReview
         # alibaba/open-code-review, pinned to a full commit SHA (dependabot's
         # SHA-commented pattern). SHA was resolved live from upstream's
@@ -1185,3 +1194,15 @@ jobs:
         # mktemp/printf semantics are relied upon — pin the shell explicitly so
         # self-hosted runners don't fall back to sh or pwsh.
         shell: bash
+      - name: Hand the workspace back to the host user
+        if: always()
+        # Root-owned leftovers in a self-hosted runner's persistent workspace
+        # break the next host-side job's checkout with EACCES (see the ci.yml
+        # comments in the estate's repos: the 25k-unlink incident). The
+        # container is root, so everything it wrote needs handing back.
+        # Ownership is taken from the workspace root, not hardcoded: GitHub
+        # -hosted runners run the service as uid 1001 (`runner`), self-hosted
+        # lanes here as uid 1000 (`gift`).
+        run: |
+          owner="$(stat -c '%u:%g' "$GITHUB_WORKSPACE/../..")"
+          chown -R "$owner" "$GITHUB_WORKSPACE" || true
