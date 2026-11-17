@@ -60,12 +60,14 @@ jobs:
           INJECT_TOKEN: ${{ secrets.OCR_LLM_TOKEN }}
           INJECT_MODEL: ${{ secrets.OCR_LLM_MODEL }}
         run: |
-          for v in INJECT_URL INJECT_TOKEN INJECT_MODEL; do
-            if [ -z "${!v}" ]; then
-              echo "::error::$v is empty. Provision repo secrets OCR_LLM_URL / OCR_LLM_TOKEN / OCR_LLM_MODEL (OpenCode Go endpoint, API key, and model id) before enabling review."
-              exit 1
-            fi
-          done
+          # POSIX sh on purpose: this job runs in a container, where the default
+          # shell is sh — bash-only indirection like ${!v} dies with "Bad
+          # substitution" before the check even executes (that was the
+          # container-pin regression). Direct checks work under any shell.
+          if [ -z "$INJECT_URL" ] || [ -z "$INJECT_TOKEN" ] || [ -z "$INJECT_MODEL" ]; then
+            echo "::error::One or more of OCR_LLM_URL / OCR_LLM_TOKEN / OCR_LLM_MODEL is empty. Provision all three repo secrets (OpenCode Go endpoint, API key, and model id) before enabling review."
+            exit 1
+          fi
       - name: Run OpenCodeReview
         # alibaba/open-code-review, pinned to a full commit SHA (dependabot's
         # SHA-commented pattern). SHA was resolved live from upstream's
