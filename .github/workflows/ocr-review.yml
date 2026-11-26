@@ -799,14 +799,25 @@ jobs:
               // anything a human disagrees with.
               if (v === 'fixed' && conf === 'high') {
                 if (!evidence) throw new Error('fixed/high without evidence quote')
-                if (evidence.length < 12) throw new Error(`evidence quote too short to prove a fix: "${evidence.slice(0, 40)}"`)
-                if (finding.includes(evidence)) throw new Error(`evidence quote is copied from the finding, not the fixed code: "${evidence.slice(0, 60)}"`)
-                if (!content.includes(evidence)) throw new Error(`evidence quote not found in head file: "${evidence.slice(0, 80)}"`)
+                // A thinking model often elides a long quote with "..." (or the unicode
+                // ellipsis …), which is NOT a verbatim substring of the file and so used
+                // to be rejected outright. Split on those markers into literal segments
+                // and require EVERY segment to occur verbatim in the head file: an elided
+                // bridge is accepted, but a fabricated token between two real ones still
+                // fails. A single segment (no elision) degrades to the original check.
+                const segments = evidence.split(/\.\.\.|…/).map((s) => s.trim()).filter((s) => s.length > 0)
+                if (segments.length === 0) throw new Error('fixed/high without evidence quote')
+                if (segments.join('').length < 12) throw new Error(`evidence quote too short to prove a fix: "${evidence.slice(0, 40)}"`)
+                for (const seg of segments) {
+                  if (!content.includes(seg)) throw new Error(`evidence quote not found in head file: "${seg.slice(0, 80)}"`)
+                }
+                // Every literal segment drawn from the finding itself proves nothing new.
+                if (segments.every((seg) => finding.includes(seg))) throw new Error(`evidence quote is copied from the finding, not the fixed code: "${evidence.slice(0, 60)}"`)
                 if (BASE_SHA) {
                   const baseSha = await getMergeBase()
                   const baseContent = await fileAt(baseSha, path)
                   if (baseContent === UNCLEAR) throw new Error('cannot verify evidence is new code (base version unreadable)')
-                  if (baseContent !== null && baseContent.includes(evidence)) {
+                  if (baseContent !== null && segments.every((seg) => baseContent.includes(seg))) {
                     throw new Error('evidence quote already exists at the merge-base — file unchanged, nothing was fixed here')
                   }
                 }
