@@ -642,7 +642,7 @@ jobs:
 
             // The review LLM is a thinking model: its content may wrap the verdict JSON in
             // reasoning or fences. Candidates are parsed wherever they appear (flat {...}
-            // fragments scanned back to front, whole text, fenced blocks) and SCORED: the
+            // fragments in document order, whole text, fenced blocks) and SCORED: the
             // object that satisfies the most of the response contract (verdict in range,
             // confidence valid, evidence string) wins, with later position breaking ties —
             // the final answer in a thinking-model response comes last, and neither an
@@ -650,7 +650,7 @@ jobs:
             function extractVerdictJson(text) {
               const candidates = []
               const flat = text.match(/\{[^{}]*\}/g)
-              if (flat) candidates.push(...flat.reverse())
+              if (flat) candidates.push(...flat)
               candidates.push(text.trim())
               const fenced = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)]
               for (const f of fenced) candidates.push(f[1].trim())
